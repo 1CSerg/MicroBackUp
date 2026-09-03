@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import argparse
 import configparser
 import logging
 import os
-import shlex
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Optional, Any
 
 from backup import run_backup
 
@@ -23,33 +26,33 @@ logger = logging.getLogger(LOGGER_NAME)
 class _MaxLevelFilter(logging.Filter):
     """Allow records strictly below max_level (used to keep INFO on stdout)."""
 
-    def __init__(self, max_level):
+    def __init__(self, max_level: int) -> None:
         super().__init__()
         self.max_level = max_level
 
-    def filter(self, record):
+    def filter(self, record: logging.LogRecord) -> bool:
         return record.levelno < self.max_level
 
 
 class _CurrentStreamHandler(logging.StreamHandler):
     """StreamHandler that always writes to the live sys.stdout or sys.stderr."""
 
-    def __init__(self, stream_name):
+    def __init__(self, stream_name: str) -> None:
         super().__init__(stream=getattr(sys, stream_name))
         self._stream_name = stream_name
 
-    def emit(self, record):
+    def emit(self, record: logging.LogRecord) -> None:
         self.stream = getattr(sys, self._stream_name)
         super().emit(record)
 
 
-def _clear_handlers(target):
+def _clear_handlers(target: logging.Logger) -> None:
     for handler in list(target.handlers):
         target.removeHandler(handler)
         handler.close()
 
 
-def _add_console_handlers(target, level):
+def _add_console_handlers(target: logging.Logger, level: int) -> None:
     console_fmt = logging.Formatter("%(message)s")
 
     stdout_handler = _CurrentStreamHandler("stdout")
@@ -64,7 +67,7 @@ def _add_console_handlers(target, level):
     target.addHandler(stderr_handler)
 
 
-def setup_logging(log_file=None, log_level=None, log_max_size=None, log_backup_count=None):
+def setup_logging(log_file: Optional[str] = None, log_level: Optional[int] = None, log_max_size: Optional[int] = None, log_backup_count: Optional[int] = None) -> logging.Logger:
     """Configure console and optional rotating file logging."""
     level = DEFAULT_LOG_LEVEL if log_level is None else log_level
     backup_count = DEFAULT_LOG_BACKUP_COUNT if log_backup_count is None else log_backup_count
@@ -93,31 +96,71 @@ def setup_logging(log_file=None, log_level=None, log_max_size=None, log_backup_c
     return logger
 
 
-def parse_size(size_str):
+def parse_size(size_str: Optional[str]) -> Optional[int]:
     if not size_str:
         return None
     size_str = size_str.strip().lower()
     if size_str.endswith('k'):
-        return int(float(size_str[:-1]) * 1024)
-    elif size_str.endswith('m'):
-        return int(float(size_str[:-1]) * 1024 * 1024)
-    elif size_str.endswith('g'):
-        return int(float(size_str[:-1]) * 1024 * 1024 * 1024)
-    else:
+        multiplier = 1024
+        number_part = size_str[:-1]
         try:
-            return int(size_str)
+            numeric = float(number_part)
         except ValueError:
-            raise argparse.ArgumentTypeError(f"Invalid size format: {size_str}. Use k, m, or g suffixes (e.g., 100m).")
+            raise argparse.ArgumentTypeError(
+                f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
+            )
+    elif size_str.endswith('m'):
+        multiplier = 1024 * 1024
+        number_part = size_str[:-1]
+        try:
+            numeric = float(number_part)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
+            )
+    elif size_str.endswith('g'):
+        multiplier = 1024 * 1024 * 1024
+        number_part = size_str[:-1]
+        try:
+            numeric = float(number_part)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
+            )
+    else:
+        multiplier = 1
+        try:
+            numeric = float(size_str)
+            if numeric != int(numeric):
+                raise ValueError
+            numeric = int(numeric)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
+            )
+
+    if numeric <= 0:
+        raise argparse.ArgumentTypeError(
+            f"Size must be strictly positive, got {numeric!r}."
+        )
+
+    value = int(numeric * multiplier)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"Size {numeric!r} with suffix rounds to 0 bytes; use a larger value."
+        )
+    return value
 
 
-def parse_sources(sources_str):
+def parse_sources(sources_str: str) -> list[str]:
     """Split a sources string into paths. Quotes preserve paths with spaces."""
-    # posix=False keeps backslashes in Windows paths, but leaves surrounding quotes.
-    tokens = shlex.split(sources_str, posix=False)
-    return [token[1:-1] if len(token) >= 2 and token[0] == token[-1] and token[0] in '"\'' else token for token in tokens]
+    if not sources_str:
+        return []
+    matches = re.findall(r'"([^"]+)"|\'([^\']+)\'|(\S+)', sources_str)
+    return [m[0] or m[1] or m[2] for m in matches]
 
 
-def parse_log_level(value, context):
+def parse_log_level(value: Any, context: str) -> Any:
     if not value:
         return DEFAULT_LOG_LEVEL
     name = str(value).strip().upper()
@@ -130,7 +173,7 @@ def parse_log_level(value, context):
     return getattr(logging, name)
 
 
-def parse_log_backup_count(value, context):
+def parse_log_backup_count(value: Any, context: str) -> Any:
     if value is None or value == "":
         return DEFAULT_LOG_BACKUP_COUNT
     try:
@@ -143,7 +186,25 @@ def parse_log_backup_count(value, context):
         return False
 
 
-def execute_backup(sources, dest, archive_name, split_size, password):
+def _validate_archive_name(archive_name: str) -> Optional[str]:
+    """Return an error message if archive_name is unsafe, else None."""
+    if not archive_name or archive_name in (".", ".."):
+        return f"Archive name is empty or reserved: {archive_name!r}"
+    # Reject path separators and traversal segments.
+    if "\\" in archive_name or "/" in archive_name:
+        return f"Archive name must not contain path separators: {archive_name!r}"
+    # Reject Windows-invalid filename characters.
+    if re.search(r'[<>:"|?*]', archive_name):
+        return f"Archive name contains forbidden characters: {archive_name!r}"
+    return None
+
+
+def execute_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str], check_content_hash: bool = False) -> bool:
+    name_error = _validate_archive_name(archive_name)
+    if name_error:
+        logger.error(f"Error: {name_error}")
+        return False
+
     for src in sources:
         if not os.path.exists(src):
             logger.error(f"Error: Source path does not exist: {src}")
@@ -162,7 +223,8 @@ def execute_backup(sources, dest, archive_name, split_size, password):
             dest=dest,
             archive_name=archive_name,
             split_size=split_size,
-            password=password
+            password=password,
+            check_content_hash=check_content_hash
         )
     except Exception as e:
         logger.error(f"Backup failed: {e}")
@@ -171,7 +233,7 @@ def execute_backup(sources, dest, archive_name, split_size, password):
     return True
 
 
-def parse_optional_size(value, context):
+def parse_optional_size(value: Optional[str], context: str) -> Any:
     if not value:
         return None
     try:
@@ -181,12 +243,12 @@ def parse_optional_size(value, context):
         return False
 
 
-def _apply_logging_config(global_parser, section, overrides):
+def _apply_logging_config(global_parser: configparser.ConfigParser, section: Optional[str], overrides: Optional[dict[str, Any]]) -> bool:
     """Build logging settings from [GLOBAL] with optional CLI overrides."""
     overrides = overrides or {}
 
     log_file = overrides.get("log_file")
-    if log_file is None and section:
+    if not log_file and section:
         log_file = global_parser.get(section, "log_file", fallback=None) or None
 
     if overrides.get("log_level") is not None:
@@ -237,7 +299,7 @@ def _apply_logging_config(global_parser, section, overrides):
     return True
 
 
-def run_from_config(config_path, log_overrides=None):
+def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = None, cli_check_content_hash: bool = False) -> bool:
     parser = configparser.ConfigParser(interpolation=None)
     try:
         with open(config_path, encoding='utf-8') as f:
@@ -252,6 +314,7 @@ def run_from_config(config_path, log_overrides=None):
     global_split = None
     global_password = None
     global_section_name = None
+    global_check_content_hash = False
     job_sections = []
 
     for section in parser.sections():
@@ -263,6 +326,7 @@ def run_from_config(config_path, log_overrides=None):
                 return False
             global_split = parsed
             global_password = parser.get(section, 'password', fallback=None) or None
+            global_check_content_hash = parser.getboolean(section, 'check_content_hash', fallback=False)
         else:
             job_sections.append(section)
 
@@ -304,8 +368,10 @@ def run_from_config(config_path, log_overrides=None):
             split_size = global_split
 
         password = parser.get(section, 'password', fallback=None) or global_password
+        
+        check_content_hash = cli_check_content_hash or parser.getboolean(section, 'check_content_hash', fallback=global_check_content_hash)
 
-        if execute_backup(sources, dest, name, split_size, password):
+        if execute_backup(sources, dest, name, split_size, password, check_content_hash=check_content_hash):
             any_ok = True
         else:
             any_failed = True
@@ -317,7 +383,7 @@ def run_from_config(config_path, log_overrides=None):
     return not any_failed
 
 
-def _cli_log_overrides(args):
+def _cli_log_overrides(args: argparse.Namespace) -> Any:
     overrides = {}
     if args.log_file is not None:
         overrides["log_file"] = args.log_file
@@ -336,7 +402,7 @@ def _cli_log_overrides(args):
     return overrides
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="MicroBackUp - Simple cross-platform incremental backup utility.")
 
     parser.add_argument(
@@ -406,6 +472,12 @@ def main():
         help="Optional. Number of rotated log files to keep. Default: 3."
     )
 
+    parser.add_argument(
+        '--check-content-hash',
+        action='store_true',
+        help="Optional. Force checking full file content hashes instead of just metadata."
+    )
+
     args = parser.parse_args()
 
     # Скрываем окно консоли в Windows, если запрошено
@@ -419,6 +491,14 @@ def main():
     if log_overrides is False:
         sys.exit(1)
 
+    if args.config:
+        if not os.path.exists(args.config):
+            logger.error(f"Error: Config file does not exist: {args.config}")
+            sys.exit(1)
+        if not run_from_config(args.config, log_overrides=log_overrides, cli_check_content_hash=args.check_content_hash):
+            sys.exit(1)
+        return
+
     setup_logging(
         log_file=log_overrides.get("log_file"),
         log_level=log_overrides.get("log_level"),
@@ -426,18 +506,10 @@ def main():
         log_backup_count=log_overrides.get("log_backup_count"),
     )
 
-    if args.config:
-        if not os.path.exists(args.config):
-            logger.error(f"Error: Config file does not exist: {args.config}")
-            sys.exit(1)
-        if not run_from_config(args.config, log_overrides=log_overrides):
-            sys.exit(1)
-        return
-
     if not args.sources or not args.dest or not args.name:
         parser.error("the following arguments are required: -s/--sources, -d/--dest, -n/--name (or use -c/--config)")
 
-    if not execute_backup(args.sources, args.dest, args.name, args.split, args.password):
+    if not execute_backup(args.sources, args.dest, args.name, args.split, args.password, args.check_content_hash):
         sys.exit(1)
 
 

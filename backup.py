@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import hashlib
 import json
@@ -5,11 +7,17 @@ import datetime
 import logging
 import py7zr
 import multivolumefile
+import re
+import shutil
+import tempfile
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger("microbackup")
 
-def get_all_paths(sources):
+CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB chunk size for hashing
+
+def get_all_paths(sources: list[str]) -> list[tuple[str, str, str]]:
     """
     Returns a list of all files and directories in the given sources.
     Each item is a tuple (absolute_path, relative_path_for_archive).
@@ -39,30 +47,32 @@ def get_all_paths(sources):
                     
     return all_paths
 
-def count_items(paths):
+def count_items(paths: list[tuple[str, str, str]]) -> tuple[int, int]:
     files_count = sum(1 for p in paths if p[2] == 'file')
     dirs_count = sum(1 for p in paths if p[2] == 'dir')
     return files_count, dirs_count
 
-def compute_names_hash(paths):
-    # Sort relative paths to ensure consistent hashing
-    rel_paths = sorted([p[1] for p in paths])
+def compute_names_hash(paths: list[tuple[str, str, str]]) -> str:
+    # Sort relative paths to ensure consistent hashing.
+    # Normalize separators to '/' so hashes stay stable across platforms.
+    rel_paths = sorted(p[1].replace('\\', '/') for p in paths)
     hasher = hashlib.sha256()
     for p in rel_paths:
         hasher.update(p.encode('utf-8'))
     return hasher.hexdigest()
 
-def compute_file_hash(filepath):
+def compute_file_hash(filepath: str) -> str:
     hasher = hashlib.sha256()
     try:
         with open(filepath, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096 * 1024), b""):
+            for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
                 hasher.update(chunk)
-    except Exception as e:
-        logger.warning(f"Warning: Could not read file {filepath} for hashing: {e}")
+    except OSError as e:
+        logger.error(f"Error: Could not read file {filepath} for hashing: {e}")
+        return f"ERROR:{filepath}"
     return hasher.hexdigest()
 
-def compute_content_hash(paths):
+def compute_content_hash(paths: list[tuple[str, str, str]]) -> str:
     # Sort relative paths to ensure consistent hashing order
     file_paths = sorted([p for p in paths if p[2] == 'file'], key=lambda x: x[1])
     
@@ -72,40 +82,98 @@ def compute_content_hash(paths):
         hasher.update(f_hash.encode('utf-8'))
     return hasher.hexdigest()
 
-def create_archive(sources, dest, archive_name, split_size, password):
-    archive_path = Path(dest) / f"{archive_name}.7z"
+def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> str:
+    # Sort relative paths to ensure consistent hashing order
+    file_paths = sorted([p for p in paths if p[2] == 'file'], key=lambda x: x[1])
+    
+    hasher = hashlib.sha256()
+    for abs_path, rel_path, _ in file_paths:
+        try:
+            stat = os.stat(abs_path)
+            # Normalize separators so metadata hash is stable across platforms.
+            norm_rel = rel_path.replace('\\', '/')
+            meta_str = f"{norm_rel}:{stat.st_size}:{stat.st_mtime}"
+            hasher.update(meta_str.encode('utf-8'))
+        except OSError as e:
+            logger.error(f"Error: Could not read metadata for {abs_path}: {e}")
+            hasher.update(f"ERROR:{abs_path}".encode('utf-8'))
+    return hasher.hexdigest()
+
+def create_archive(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str]) -> None:
+    dest_path = Path(dest)
+    archive_path = dest_path / f"{archive_name}.7z"
     
     logger.info(f"Creating archive: {archive_path}")
-    
-    filters = None
-    if password:
-        # Note: py7zr handles password encryption
-        pass
 
-    if split_size:
-        logger.info(f"Splitting archive into volumes of size {split_size} bytes")
-        with multivolumefile.open(archive_path, mode='wb', volume=split_size) as target_archive:
-            with py7zr.SevenZipFile(target_archive, 'w', password=password) as archive:
+    seen_arcnames = set()
+
+    def add_to_archive(archive, src_path):
+        arcname = src_path.name
+        if arcname in seen_arcnames:
+            logger.error(f"Duplicate archive name detected: '{arcname}' for path '{src_path}'.")
+            original_arcname = arcname
+            counter = 1
+            while arcname in seen_arcnames:
+                arcname = f"{original_arcname}_{counter}"
+                counter += 1
+            logger.info(f"Renamed '{original_arcname}' to '{arcname}' in the archive to prevent collision.")
+        
+        seen_arcnames.add(arcname)
+        
+        if src_path.is_file():
+            archive.write(src_path, arcname)
+        else:
+            archive.writeall(src_path, arcname)
+
+    pattern = re.compile(rf"^{re.escape(archive_name)}\.7z(\.\d+)?$")
+    old_files = [p for p in dest_path.iterdir() if p.is_file() and pattern.match(p.name)]
+
+    temp_dir = None
+    if old_files:
+        temp_dir = tempfile.mkdtemp(prefix=".microbackup_tmp_", dir=dest)
+        logger.info(f"Moving {len(old_files)} old archive files to temporary directory")
+        for p in old_files:
+            shutil.move(str(p), str(Path(temp_dir) / p.name))
+
+    try:
+        if split_size:
+            logger.info(f"Splitting archive into volumes of size {split_size} bytes")
+            with multivolumefile.open(archive_path, mode='wb', volume=split_size) as target_archive:
+                with py7zr.SevenZipFile(target_archive, 'w', password=password, header_encryption=bool(password)) as archive:
+                    for src in sources:
+                        src_path = Path(src).resolve()
+                        add_to_archive(archive, src_path)
+        else:
+            with py7zr.SevenZipFile(archive_path, 'w', password=password, header_encryption=bool(password)) as archive:
                 for src in sources:
                     src_path = Path(src).resolve()
-                    arcname = src_path.name
-                    if src_path.is_file():
-                        archive.write(src_path, arcname)
-                    else:
-                        archive.writeall(src_path, arcname)
-    else:
-        with py7zr.SevenZipFile(archive_path, 'w', password=password) as archive:
-            for src in sources:
-                src_path = Path(src).resolve()
-                arcname = src_path.name
-                if src_path.is_file():
-                    archive.write(src_path, arcname)
-                else:
-                    archive.writeall(src_path, arcname)
-                    
-    logger.info("Archive created successfully.")
+                    add_to_archive(archive, src_path)
+                        
+        if temp_dir:
+            logger.info("Removing old archive files")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+        logger.info("Archive created successfully.")
+    except Exception:
+        if temp_dir:
+            logger.info("Archive creation failed, restoring old archive files")
+            # Remove any partial new archive files (including extra split volumes
+            # that the failed run may have created beyond what the old set had).
+            for p in dest_path.iterdir():
+                if p.is_file() and pattern.match(p.name):
+                    try:
+                        p.unlink()
+                    except OSError as e:
+                        logger.warning(f"Could not remove partial archive file {p}: {e}")
+            for p in Path(temp_dir).iterdir():
+                shutil.move(str(p), str(dest_path / p.name))
+            try:
+                Path(temp_dir).rmdir()
+            except OSError:
+                pass
+        raise
 
-def run_backup(sources, dest, archive_name, split_size=None, password=None):
+def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int] = None, password: Optional[str] = None, check_content_hash: bool = False) -> None:
     info_file = Path(dest) / f"{archive_name}_hash.json"
     
     logger.info("Gathering file list...")
@@ -116,36 +184,57 @@ def run_backup(sources, dest, archive_name, split_size=None, password=None):
     
     need_backup = True
     names_hash = None
+    metadata_hash = None
     content_hash = None
     
     if info_file.exists():
-        try:
-            with open(info_file, 'r', encoding='utf-8') as f:
-                old_info = json.load(f)
-                
-            logger.info("Checking state against previous backup...")
+        archive_path = Path(dest) / f"{archive_name}.7z"
+        archive_exists = archive_path.exists()
+        if not archive_exists:
+            pattern = re.compile(rf"^{re.escape(archive_name)}\.7z\.\d+$")
+            archive_exists = any(p.is_file() and pattern.match(p.name) for p in Path(dest).iterdir())
             
-            # Step 1: Check counts
-            if old_info.get('files_count') == files_count and old_info.get('dirs_count') == dirs_count:
-                logger.info("Counts match. Checking names hash...")
-                # Step 2: Check names hash
-                names_hash = compute_names_hash(all_paths)
-                if old_info.get('names_hash') == names_hash:
-                    logger.info("Names hash matches. Checking content hash...")
-                    # Step 3: Check content hash
-                    content_hash = compute_content_hash(all_paths)
-                    if old_info.get('content_hash') == content_hash:
-                        logger.info("Content hash matches. No backup needed.")
-                        need_backup = False
-                    else:
-                        logger.info("Content hash differs.")
-                else:
-                    logger.info("Names hash differs.")
-            else:
-                logger.info("Counts differ.")
+        if not archive_exists:
+            logger.info("Archive file(s) not found on disk. Will perform full backup.")
+        else:
+            try:
+                with open(info_file, 'r', encoding='utf-8') as f:
+                    old_info = json.load(f)
+                    
+                logger.info("Checking state against previous backup...")
                 
-        except Exception as e:
-            logger.error(f"Error reading info file {info_file}: {e}. Will perform full backup.")
+                # Step 1: Check counts
+                if old_info.get('files_count') == files_count and old_info.get('dirs_count') == dirs_count:
+                    logger.info("Counts match. Checking names hash...")
+                    # Step 2: Check names hash
+                    names_hash = compute_names_hash(all_paths)
+                    if old_info.get('names_hash') == names_hash:
+                        logger.info("Names hash matches. Checking metadata hash...")
+                        # Step 3: Check metadata hash
+                        metadata_hash = compute_metadata_hash(all_paths)
+                        if old_info.get('metadata_hash') == metadata_hash:
+                            logger.info("Metadata hash matches.")
+                            # Step 4: Check content hash if requested
+                            if check_content_hash:
+                                logger.info("Checking content hash...")
+                                content_hash = compute_content_hash(all_paths)
+                                if old_info.get('content_hash') == content_hash:
+                                    logger.info("Content hash matches. No backup needed.")
+                                    need_backup = False
+                                else:
+                                    logger.info("Content hash differs.")
+                            else:
+                                logger.info("Content hash check skipped. No backup needed.")
+                                need_backup = False
+                        else:
+                            logger.info("Metadata hash differs.")
+                    else:
+                        logger.info("Names hash differs.")
+                else:
+                    logger.info("Counts differ.")
+                    
+            except (OSError, ValueError) as e:
+                logger.error(f"Error reading info file {info_file}: {e}. Will perform full backup.")
     else:
         logger.info("No previous backup info found. Will perform full backup.")
 
@@ -154,7 +243,10 @@ def run_backup(sources, dest, archive_name, split_size=None, password=None):
         if names_hash is None:
             logger.info("Computing names hash...")
             names_hash = compute_names_hash(all_paths)
-        if content_hash is None:
+        if metadata_hash is None:
+            logger.info("Computing metadata hash...")
+            metadata_hash = compute_metadata_hash(all_paths)
+        if check_content_hash and content_hash is None:
             logger.info("Computing content hash...")
             content_hash = compute_content_hash(all_paths)
             
@@ -166,10 +258,12 @@ def run_backup(sources, dest, archive_name, split_size=None, password=None):
             'files_count': files_count,
             'dirs_count': dirs_count,
             'names_hash': names_hash,
-            'content_hash': content_hash,
+            'metadata_hash': metadata_hash,
             'last_check_date': now_str,
             'last_update_date': now_str
         }
+        if check_content_hash:
+            new_info['content_hash'] = content_hash
         
         with open(info_file, 'w', encoding='utf-8') as f:
             json.dump(new_info, f, indent=4)

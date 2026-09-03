@@ -1,6 +1,5 @@
 import json
 import os
-import time
 from pathlib import Path
 
 import multivolumefile
@@ -8,7 +7,7 @@ import py7zr
 import pytest
 
 from backup import (
-    compute_content_hash,
+    compute_metadata_hash,
     compute_file_hash,
     compute_names_hash,
     count_items,
@@ -98,20 +97,20 @@ class TestHashing:
         h2 = compute_file_hash(str(f))
         assert h1 != h2
 
-    def test_file_hash_unreadable_file_returns_empty_digest(self, tmp_path: Path, capsys):
+    def test_file_hash_unreadable_file_returns_unique_error_marker(self, tmp_path: Path, capsys):
         missing = tmp_path / "gone.bin"
         digest = compute_file_hash(str(missing))
-        assert digest == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        assert digest.startswith("ERROR:")
         assert "Could not read file" in capsys.readouterr().err
 
-    def test_content_hash_changes_on_file_edit(self, tmp_path: Path):
+    def test_metadata_hash_changes_on_file_edit(self, tmp_path: Path):
         folder = tmp_path / "src"
         folder.mkdir()
         target = folder / "a.txt"
         target.write_text("v1", encoding="utf-8")
-        h1 = compute_content_hash(get_all_paths([str(folder)]))
+        h1 = compute_metadata_hash(get_all_paths([str(folder)]))
         target.write_text("v2", encoding="utf-8")
-        h2 = compute_content_hash(get_all_paths([str(folder)]))
+        h2 = compute_metadata_hash(get_all_paths([str(folder)]))
         assert h1 != h2
         assert len(h1) == 64
 
@@ -133,7 +132,7 @@ class TestBackupIntegration:
         assert data["files_count"] == 3
         assert data["dirs_count"] == 2
         assert data["names_hash"]
-        assert data["content_hash"]
+        assert data["metadata_hash"]
         assert data["last_check_date"]
         assert data["last_update_date"]
 
@@ -174,14 +173,13 @@ class TestBackupIntegration:
         mtime_before = archive.stat().st_mtime
         info_before = json.loads(info_path.read_text(encoding="utf-8"))
 
-        time.sleep(0.05)
         run_backup([str(src)], str(dest), "inc")
 
         info_after = json.loads(info_path.read_text(encoding="utf-8"))
         assert archive.stat().st_mtime == mtime_before
         assert info_after["last_update_date"] == info_before["last_update_date"]
         assert info_after["last_check_date"] >= info_before["last_check_date"]
-        assert info_after["content_hash"] == info_before["content_hash"]
+        assert info_after["metadata_hash"] == info_before["metadata_hash"]
 
     def test_rebuilds_archive_when_content_changes(self, tmp_path: Path):
         src = tmp_path / "src"
@@ -195,12 +193,14 @@ class TestBackupIntegration:
         info_before = json.loads((dest / "inc_hash.json").read_text(encoding="utf-8"))
         mtime_before = (dest / "inc.7z").stat().st_mtime
 
-        time.sleep(0.05)
         target.write_text("v2", encoding="utf-8")
+        # Force mtime forward so metadata hash differs even on coarse-resolution FS.
+        forced_mtime = os.stat(target).st_mtime + 10
+        os.utime(target, (os.stat(target).st_atime, forced_mtime))
         run_backup([str(src)], str(dest), "inc")
 
         info_after = json.loads((dest / "inc_hash.json").read_text(encoding="utf-8"))
-        assert info_after["content_hash"] != info_before["content_hash"]
+        assert info_after["metadata_hash"] != info_before["metadata_hash"]
         assert info_after["last_update_date"] != info_before["last_update_date"]
         assert (dest / "inc.7z").stat().st_mtime >= mtime_before
 
@@ -232,6 +232,7 @@ class TestBackupIntegration:
         dest = tmp_path / "dest"
         dest.mkdir()
         (dest / "bad_hash.json").write_text("{not-json", encoding="utf-8")
+        (dest / "bad.7z").write_text("dummy archive", encoding="utf-8")
 
         run_backup([str(src)], str(dest), "bad")
         assert (dest / "bad.7z").is_file()
@@ -302,3 +303,84 @@ class TestBackupIntegration:
         extracted = tmp_path / "out"
         _extract_archive(dest / "direct.7z", extracted)
         assert (extracted / "only.txt").read_text(encoding="utf-8") == "solo"
+
+    def test_creates_backup_with_check_content_hash_true(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("content1", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "inc", check_content_hash=True)
+        info1 = json.loads((dest / "inc_hash.json").read_text(encoding="utf-8"))
+        assert "content_hash" in info1
+
+        # Capture original mtime, then change content and restore mtime so that
+        # metadata hash stays the same and only content hash differs.
+        original_mtime = os.stat(src / "a.txt").st_mtime
+        (src / "a.txt").write_text("content2", encoding="utf-8")
+        os.utime(src / "a.txt", (os.stat(src / "a.txt").st_atime, original_mtime))
+
+        run_backup([str(src)], str(dest), "inc", check_content_hash=True)
+        info2 = json.loads((dest / "inc_hash.json").read_text(encoding="utf-8"))
+        # Metadata hash must match (mtime was restored), but content hash must differ.
+        assert info2["metadata_hash"] == info1["metadata_hash"]
+        assert info2["content_hash"] != info1["content_hash"]
+        assert info2["last_update_date"] != info1["last_update_date"]
+
+    def test_missing_archive_triggers_rebuild(self, tmp_path: Path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("stable", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "inc")
+        assert (dest / "inc.7z").is_file()
+        
+        # Delete archive but keep hash json
+        (dest / "inc.7z").unlink()
+        
+        run_backup([str(src)], str(dest), "inc")
+        assert (dest / "inc.7z").is_file()
+        assert "Archive file(s) not found on disk" in capsys.readouterr().out
+
+    def test_header_encryption_prevents_reading_file_list(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "secret.txt").write_text("classified", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "secret_arc", password="s3cret")
+        
+        archive_path = dest / "secret_arc.7z"
+        # Try to read without password - should fail because headers are encrypted
+        with pytest.raises(py7zr.exceptions.PasswordRequired):
+            with py7zr.SevenZipFile(archive_path, 'r') as archive:
+                archive.getnames()
+
+    def test_duplicate_archive_names_resolved(self, tmp_path: Path, capsys):
+        src1 = tmp_path / "src1"
+        src1.mkdir()
+        (src1 / "file.txt").write_text("one", encoding="utf-8")
+        
+        src2 = tmp_path / "src2"
+        src2.mkdir()
+        (src2 / "file.txt").write_text("two", encoding="utf-8")
+        
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        create_archive([str(src1 / "file.txt"), str(src2 / "file.txt")], str(dest), "dup", None, None)
+        
+        captured = capsys.readouterr()
+        out = captured.out
+        err = captured.err
+        assert "Duplicate archive name detected" in err or "Duplicate archive name detected" in out
+        assert "Renamed 'file.txt' to 'file.txt_1'" in out or "Renamed 'file.txt' to 'file.txt_1'" in err
+        
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "dup.7z", extracted)
+        assert (extracted / "file.txt").read_text(encoding="utf-8") == "one"
+        assert (extracted / "file.txt_1").read_text(encoding="utf-8") == "two"
