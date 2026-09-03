@@ -1,6 +1,24 @@
 import os
+import shutil
 import subprocess
 import sys
+
+def _clean_build_dirs():
+    root = os.path.dirname(os.path.abspath(__file__))
+    for name in ("build", "dist"):
+        path = os.path.join(root, name)
+        if os.path.isdir(path):
+            print(f"Cleaning {path}/")
+            shutil.rmtree(path, ignore_errors=True)
+    # Remove stale .spec files from previous PyInstaller runs.
+    for entry in os.listdir(root):
+        if entry.endswith(".spec"):
+            spec = os.path.join(root, entry)
+            print(f"Removing stale spec: {entry}")
+            try:
+                os.remove(spec)
+            except OSError:
+                pass
 
 def run_build(name, noconsole=False):
     print(f"\n[{name}] Starting build {'(without console)' if noconsole else '(with console)'}...")
@@ -39,6 +57,7 @@ def ensure_dependencies():
 
 def build():
     ensure_dependencies()
+    _clean_build_dirs()
 
     # 1. Сборка консольной версии
     run_build("MicroBackUp", noconsole=False)

@@ -10,7 +10,13 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Any
 
-from backup import run_backup
+try:
+    from backup import run_backup
+except ImportError as _exc:  # pragma: no cover - depends on runtime environment
+    run_backup = None  # type: ignore[assignment]
+    _IMPORT_ERROR = _exc
+else:
+    _IMPORT_ERROR = None
 
 __version__ = "1.0.0"
 
@@ -21,6 +27,10 @@ DEFAULT_LOG_BACKUP_COUNT = 3
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 logger = logging.getLogger(LOGGER_NAME)
+
+
+class ConfigError(ValueError):
+    """Raised when a config value is invalid."""
 
 
 class _MaxLevelFilter(logging.Filter):
@@ -141,20 +151,19 @@ def parse_sources(sources_str: str) -> list[str]:
     return [m[0] or m[1] or m[2] for m in matches]
 
 
-def parse_log_level(value: Any, context: str) -> Any:
+def parse_log_level(value: Any, context: str) -> int:
     if not value:
         return DEFAULT_LOG_LEVEL
     name = str(value).strip().upper()
     if name not in VALID_LOG_LEVELS:
-        logger.error(
-            f"Error: {context}: invalid log level '{value}'. "
+        raise ConfigError(
+            f"{context}: invalid log level '{value}'. "
             f"Use {', '.join(VALID_LOG_LEVELS)}."
         )
-        return False
     return getattr(logging, name)
 
 
-def parse_log_backup_count(value: Any, context: str) -> Any:
+def parse_log_backup_count(value: Any, context: str) -> int:
     if value is None or value == "":
         return DEFAULT_LOG_BACKUP_COUNT
     try:
@@ -163,8 +172,7 @@ def parse_log_backup_count(value: Any, context: str) -> Any:
             raise ValueError
         return count
     except (TypeError, ValueError):
-        logger.error(f"Error: {context}: invalid log_backup_count '{value}'. Use a non-negative integer.")
-        return False
+        raise ConfigError(f"{context}: invalid log_backup_count '{value}'. Use a non-negative integer.")
 
 
 def _validate_archive_name(archive_name: str) -> Optional[str]:
@@ -181,6 +189,13 @@ def _validate_archive_name(archive_name: str) -> Optional[str]:
 
 
 def execute_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str], check_content_hash: bool = False) -> bool:
+    if run_backup is None:
+        logger.error(
+            f"Error: required dependency missing ({_IMPORT_ERROR}). "
+            f"Install runtime dependencies: pip install -r requirements.txt"
+        )
+        return False
+
     name_error = _validate_archive_name(archive_name)
     if name_error:
         logger.error(f"Error: {name_error}")
@@ -214,18 +229,20 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
     return True
 
 
-def parse_optional_size(value: Optional[str], context: str) -> Any:
+def parse_optional_size(value: Optional[str], context: str) -> Optional[int]:
     if not value:
         return None
     try:
         return parse_size(value)
     except argparse.ArgumentTypeError as e:
-        logger.error(f"Error: {context}: {e}")
-        return False
+        raise ConfigError(f"{context}: {e}") from e
 
 
-def _apply_logging_config(global_parser: configparser.ConfigParser, section: Optional[str], overrides: Optional[dict[str, Any]]) -> bool:
-    """Build logging settings from [GLOBAL] with optional CLI overrides."""
+def _apply_logging_config(global_parser: configparser.ConfigParser, section: Optional[str], overrides: Optional[dict[str, Any]]) -> None:
+    """Build logging settings from [GLOBAL] with optional CLI overrides.
+
+    Raises ConfigError on invalid values.
+    """
     overrides = overrides or {}
 
     log_file = overrides.get("log_file")
@@ -235,39 +252,30 @@ def _apply_logging_config(global_parser: configparser.ConfigParser, section: Opt
     if overrides.get("log_level") is not None:
         log_level = overrides["log_level"]
     elif section:
-        parsed = parse_log_level(
+        log_level = parse_log_level(
             global_parser.get(section, "log_level", fallback=None),
             f"[{section}] log_level",
         )
-        if parsed is False:
-            return False
-        log_level = parsed
     else:
         log_level = DEFAULT_LOG_LEVEL
 
     if overrides.get("log_max_size") is not None:
         log_max_size = overrides["log_max_size"]
     elif section:
-        parsed = parse_optional_size(
+        log_max_size = parse_optional_size(
             global_parser.get(section, "log_max_size", fallback=None),
             f"[{section}] log_max_size",
         )
-        if parsed is False:
-            return False
-        log_max_size = parsed
     else:
         log_max_size = None
 
     if overrides.get("log_backup_count") is not None:
         log_backup_count = overrides["log_backup_count"]
     elif section:
-        parsed = parse_log_backup_count(
+        log_backup_count = parse_log_backup_count(
             global_parser.get(section, "log_backup_count", fallback=None),
             f"[{section}] log_backup_count",
         )
-        if parsed is False:
-            return False
-        log_backup_count = parsed
     else:
         log_backup_count = DEFAULT_LOG_BACKUP_COUNT
 
@@ -277,7 +285,6 @@ def _apply_logging_config(global_parser: configparser.ConfigParser, section: Opt
         log_max_size=log_max_size,
         log_backup_count=log_backup_count,
     )
-    return True
 
 
 def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = None, cli_check_content_hash: bool = False) -> bool:
@@ -298,20 +305,24 @@ def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = 
     global_check_content_hash = False
     job_sections = []
 
-    for section in parser.sections():
-        if section.upper() == GLOBAL_SECTION:
-            global_section_name = section
-            split_raw = parser.get(section, 'split', fallback=None)
-            parsed = parse_optional_size(split_raw, f"[{section}] split")
-            if parsed is False:
-                return False
-            global_split = parsed
-            global_password = parser.get(section, 'password', fallback=None) or None
-            global_check_content_hash = parser.getboolean(section, 'check_content_hash', fallback=False)
-        else:
-            job_sections.append(section)
+    try:
+        for section in parser.sections():
+            if section.upper() == GLOBAL_SECTION:
+                global_section_name = section
+                split_raw = parser.get(section, 'split', fallback=None)
+                global_split = parse_optional_size(split_raw, f"[{section}] split")
+                global_password = parser.get(section, 'password', fallback=None) or None
+                global_check_content_hash = parser.getboolean(section, 'check_content_hash', fallback=False)
+            else:
+                job_sections.append(section)
+    except ConfigError as e:
+        logger.error(f"Error: {e}")
+        return False
 
-    if _apply_logging_config(parser, global_section_name, log_overrides) is False:
+    try:
+        _apply_logging_config(parser, global_section_name, log_overrides)
+    except ConfigError as e:
+        logger.error(f"Error: {e}")
         return False
 
     if not job_sections:
@@ -341,16 +352,24 @@ def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = 
 
         split_raw = parser.get(section, 'split', fallback=None)
         if split_raw:
-            split_size = parse_optional_size(split_raw, f"[{section}] split")
-            if split_size is False:
+            try:
+                split_size = parse_optional_size(split_raw, f"[{section}] split")
+            except ConfigError as e:
+                logger.error(f"Error: {e}")
                 any_failed = True
                 continue
         else:
             split_size = global_split
 
-        password = parser.get(section, 'password', fallback=None) or global_password
-        
-        check_content_hash = cli_check_content_hash or parser.getboolean(section, 'check_content_hash', fallback=global_check_content_hash)
+        if parser.has_option(section, 'password'):
+            password = parser.get(section, 'password').strip() or None
+        else:
+            password = global_password
+
+        if parser.has_option(section, 'check_content_hash'):
+            check_content_hash = parser.getboolean(section, 'check_content_hash')
+        else:
+            check_content_hash = cli_check_content_hash or global_check_content_hash
 
         if execute_backup(sources, dest, name, split_size, password, check_content_hash=check_content_hash):
             any_ok = True
@@ -364,22 +383,17 @@ def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = 
     return not any_failed
 
 
-def _cli_log_overrides(args: argparse.Namespace) -> Any:
-    overrides = {}
+def _cli_log_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Build CLI logging overrides. Raises ConfigError on invalid values."""
+    overrides: dict[str, Any] = {}
     if args.log_file is not None:
         overrides["log_file"] = args.log_file
     if args.log_level is not None:
-        parsed = parse_log_level(args.log_level, "--log-level")
-        if parsed is False:
-            return False
-        overrides["log_level"] = parsed
+        overrides["log_level"] = parse_log_level(args.log_level, "--log-level")
     if args.log_max_size is not None:
         overrides["log_max_size"] = args.log_max_size
     if args.log_backup_count is not None:
-        parsed = parse_log_backup_count(args.log_backup_count, "--log-backup-count")
-        if parsed is False:
-            return False
-        overrides["log_backup_count"] = parsed
+        overrides["log_backup_count"] = parse_log_backup_count(args.log_backup_count, "--log-backup-count")
     return overrides
 
 
@@ -471,8 +485,10 @@ def main() -> None:
         else:
             logger.warning("--hide is supported only on Windows; ignored on this platform.")
 
-    log_overrides = _cli_log_overrides(args)
-    if log_overrides is False:
+    try:
+        log_overrides = _cli_log_overrides(args)
+    except ConfigError as e:
+        logger.error(f"Error: {e}")
         sys.exit(1)
 
     if args.config:

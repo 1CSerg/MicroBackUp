@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from main import (
+    ConfigError,
     execute_backup,
     logger,
     main,
@@ -81,11 +82,9 @@ class TestParseOptionalSize:
     def test_valid_size(self):
         assert parse_optional_size("10k", "ctx") == 10 * 1024
 
-    def test_invalid_size_returns_false(self, capsys):
-        assert parse_optional_size("nope", "[GLOBAL] split") is False
-        err = capsys.readouterr().err
-        assert "[GLOBAL] split" in err
-        assert "Invalid size format" in err
+    def test_invalid_size_raises_config_error(self):
+        with pytest.raises(ConfigError, match=r"\[GLOBAL\] split: Invalid size format"):
+            parse_optional_size("nope", "[GLOBAL] split")
 
 
 class TestExecuteBackup:
@@ -337,6 +336,69 @@ name = bad
         assert (dest / "good.7z").is_file()
         assert "Source path does not exist" in capsys.readouterr().err
 
+    def test_empty_section_password_clears_global(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+
+        conf = self._write_conf(
+            tmp_path / "pw.conf",
+            f"""[GLOBAL]
+password = global_secret
+
+[NoPassword]
+sources = {src}
+dest = {dest}
+name = no_pw
+password =
+""",
+        )
+
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(password)
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+
+        assert ok is True
+        assert captured == [None]
+
+    def test_cli_check_content_hash_respects_explicit_section_false(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+
+        conf = self._write_conf(
+            tmp_path / "cch.conf",
+            f"""[GLOBAL]
+check_content_hash = true
+
+[ForceOff]
+sources = {src}
+dest = {dest}
+name = off
+check_content_hash = false
+""",
+        )
+
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(check_content_hash)
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf), cli_check_content_hash=True)
+
+        assert ok is True
+        # Explicit `false` in section must win over CLI flag.
+        assert captured == [False]
+
 
 class TestMainCli:
     def test_missing_required_args(self, monkeypatch):
@@ -538,11 +600,9 @@ class TestLogHelpers:
         assert parse_log_level("debug", "ctx") == logging.DEBUG
         assert parse_log_level("ERROR", "ctx") == logging.ERROR
 
-    def test_parse_log_level_invalid(self, capsys):
-        assert parse_log_level("nope", "[GLOBAL] log_level") is False
-        err = capsys.readouterr().err
-        assert "[GLOBAL] log_level" in err
-        assert "invalid log level" in err
+    def test_parse_log_level_invalid(self):
+        with pytest.raises(ConfigError, match=r"\[GLOBAL\] log_level: invalid log level"):
+            parse_log_level("nope", "[GLOBAL] log_level")
 
     def test_parse_log_backup_count_default(self):
         assert parse_log_backup_count(None, "ctx") == 3
@@ -552,11 +612,11 @@ class TestLogHelpers:
         assert parse_log_backup_count("5", "ctx") == 5
         assert parse_log_backup_count(0, "ctx") == 0
 
-    def test_parse_log_backup_count_invalid(self, capsys):
-        assert parse_log_backup_count("-1", "ctx") is False
-        assert parse_log_backup_count("abc", "ctx") is False
-        err = capsys.readouterr().err
-        assert "invalid log_backup_count" in err
+    def test_parse_log_backup_count_invalid(self):
+        with pytest.raises(ConfigError, match="invalid log_backup_count"):
+            parse_log_backup_count("-1", "ctx")
+        with pytest.raises(ConfigError, match="invalid log_backup_count"):
+            parse_log_backup_count("abc", "ctx")
 
 
 class TestLoggingSetup:

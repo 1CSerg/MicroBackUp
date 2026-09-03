@@ -27,14 +27,14 @@ def get_all_paths(sources: list[str]) -> list[tuple[str, str, str]]:
     for src in sources:
         src_path = Path(src).resolve()
         parent_dir = src_path.parent
-        
+
         if src_path.is_file():
             rel_path = src_path.relative_to(parent_dir)
             all_paths.append((str(src_path), str(rel_path), 'file'))
         elif src_path.is_dir():
             rel_path = src_path.relative_to(parent_dir)
             all_paths.append((str(src_path), str(rel_path), 'dir'))
-            
+
             for root, dirs, files in os.walk(src_path):
                 for d in dirs:
                     d_path = Path(root) / d
@@ -44,7 +44,9 @@ def get_all_paths(sources: list[str]) -> list[tuple[str, str, str]]:
                     f_path = Path(root) / f
                     f_rel = f_path.relative_to(parent_dir)
                     all_paths.append((str(f_path), str(f_rel), 'file'))
-                    
+        else:
+            logger.warning(f"Source path does not exist, skipping: {src}")
+
     return all_paths
 
 def count_items(paths: list[tuple[str, str, str]]) -> tuple[int, int]:

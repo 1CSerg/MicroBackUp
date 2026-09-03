@@ -27,3 +27,6 @@ htmlcov/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Local config (may contain secrets). Use MicroBackUp.conf.example as a template.
+MicroBackUp.conf

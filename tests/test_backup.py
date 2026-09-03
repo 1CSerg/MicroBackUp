@@ -62,6 +62,10 @@ class TestGetAllPathsAndCount:
         assert paths == []
         assert count_items(paths) == (0, 0)
 
+    def test_missing_source_logs_warning(self, tmp_path: Path, capsys):
+        get_all_paths([str(tmp_path / "does_not_exist")])
+        assert "does not exist" in capsys.readouterr().err
+
 
 class TestHashing:
     def test_names_hash_stable_and_order_independent(self, source_tree: Path):
