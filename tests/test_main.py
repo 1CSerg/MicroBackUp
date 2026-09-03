@@ -962,9 +962,11 @@ class TestMainCli:
                 "--log-file", str(tmp_path / "bad.log"),
             ],
         )
-        with patch("main.setup_logging", side_effect=ConfigError("Failed to open log")):
-            with pytest.raises(SystemExit) as exc:
-                main()
+        with (
+            patch("main.setup_logging", side_effect=ConfigError("Failed to open log")),
+            pytest.raises(SystemExit) as exc,
+        ):
+            main()
         assert exc.value.code == 1
         assert "Failed to open log" in capsys.readouterr().err
 
@@ -1152,9 +1154,11 @@ name = logged
         assert "invalid log level" in capsys.readouterr().err
 
     def test_setup_logging_oserror_raises_config_error(self, tmp_path):
-        with patch("main.RotatingFileHandler", side_effect=OSError("Permission denied")):
-            with pytest.raises(ConfigError, match="Could not initialize log file"):
-                setup_logging(log_file=str(tmp_path / "denied.log"))
+        with (
+            patch("main.RotatingFileHandler", side_effect=OSError("Permission denied")),
+            pytest.raises(ConfigError, match="Could not initialize log file"),
+        ):
+            setup_logging(log_file=str(tmp_path / "denied.log"))
 
     def test_current_stream_handler_flush(self):
         from main import _CurrentStreamHandler

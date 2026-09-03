@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import os
+import datetime
 import hashlib
 import json
-import datetime
 import logging
-import py7zr
-import multivolumefile
+import os
 import re
 import secrets
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional
+
+import multivolumefile
+import py7zr
 
 logger = logging.getLogger("microbackup")
 
@@ -25,7 +25,7 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 )
 
 
-def _validate_archive_name(archive_name: str) -> Optional[str]:
+def _validate_archive_name(archive_name: str) -> str | None:
     """Return an error message if archive_name is unsafe, else None."""
     if not archive_name or archive_name in (".", ".."):
         return f"Archive name is empty or reserved: {archive_name!r}"
@@ -49,7 +49,7 @@ def _validate_archive_name(archive_name: str) -> Optional[str]:
 
 def _hash_password(password: str, salt: str) -> str:
     """Compute a salted hash of the password for change detection."""
-    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
 
 
 def get_all_paths(sources: list[str]) -> list[tuple[str, str, str]]:
@@ -122,7 +122,7 @@ def compute_file_hash(filepath: str) -> str:
         return f"ERROR:{filepath}"
     return hasher.hexdigest()
 
-def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[str], bool]:
+def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[str | None, bool]:
     # Sort relative paths to ensure consistent hashing order
     file_paths = sorted([p for p in paths if p[2] == 'file'], key=lambda x: x[1])
 
@@ -133,7 +133,7 @@ def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[st
         if f_hash.startswith("ERROR:"):
             had_error = True
         norm_rel = rel_path.replace('\\', '/')
-        hasher.update(f"{norm_rel}:{f_hash}".encode('utf-8'))
+        hasher.update(f"{norm_rel}:{f_hash}".encode())
     # On any read error the digest is not trustworthy as a content fingerprint:
     # return None so run_backup forces a full backup and doesn't persist a
     # hash that mixes error markers with real data.
@@ -141,7 +141,7 @@ def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[st
         return None, True
     return hasher.hexdigest(), False
 
-def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[str], bool]:
+def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[str | None, bool]:
     # Sort relative paths to ensure consistent hashing order
     file_paths = sorted([p for p in paths if p[2] == 'file'], key=lambda x: x[1])
 
@@ -161,7 +161,7 @@ def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[s
         return None, True
     return hasher.hexdigest(), False
 
-def create_archive(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str]) -> list[str]:
+def create_archive(sources: list[str], dest: str, archive_name: str, split_size: int | None, password: str | None) -> list[str]:
     name_error = _validate_archive_name(archive_name)
     if name_error:
         raise ValueError(f"Invalid archive_name: {name_error}")
@@ -209,11 +209,13 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
     try:
         if split_size:
             logger.info(f"Splitting archive into volumes of size {split_size} bytes")
-            with multivolumefile.open(archive_path, mode='wb', volume=split_size) as target_archive:
-                with py7zr.SevenZipFile(target_archive, 'w', password=password, header_encryption=bool(password)) as archive:
-                    for src in sources:
-                        src_path = Path(src).resolve()
-                        add_to_archive(archive, src_path)
+            with (
+                multivolumefile.open(archive_path, mode='wb', volume=split_size) as target_archive,
+                py7zr.SevenZipFile(target_archive, 'w', password=password, header_encryption=bool(password)) as archive,
+            ):
+                for src in sources:
+                    src_path = Path(src).resolve()
+                    add_to_archive(archive, src_path)
         else:
             with py7zr.SevenZipFile(archive_path, 'w', password=password, header_encryption=bool(password)) as archive:
                 for src in sources:
@@ -304,7 +306,7 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
-def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int] = None, password: Optional[str] = None, check_content_hash: bool = False) -> None:
+def run_backup(sources: list[str], dest: str, archive_name: str, split_size: int | None = None, password: str | None = None, check_content_hash: bool = False) -> None:
     name_error = _validate_archive_name(archive_name)
     if name_error:
         raise ValueError(f"Invalid archive_name: {name_error}")

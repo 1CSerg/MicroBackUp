@@ -8,13 +8,21 @@ import pytest
 
 from backup import (
     compute_content_hash,
-    compute_metadata_hash,
     compute_file_hash,
+    compute_metadata_hash,
     compute_names_hash,
     count_items,
     create_archive,
     get_all_paths,
     run_backup,
+)
+
+# Wrong/missing password surfaces as PasswordRequired, Bad7zFile, or TypeError
+# depending on py7zr version and whether headers are encrypted.
+_PASSWORD_FAILURES = (
+    py7zr.Bad7zFile,
+    py7zr.exceptions.PasswordRequired,
+    TypeError,
 )
 
 
@@ -25,9 +33,11 @@ def _rel_set(paths):
 def _extract_archive(archive_path: Path, dest: Path, password=None, split=False):
     dest.mkdir(parents=True, exist_ok=True)
     if split:
-        with multivolumefile.open(archive_path, mode="rb") as target:
-            with py7zr.SevenZipFile(target, "r", password=password) as archive:
-                archive.extractall(path=dest)
+        with (
+            multivolumefile.open(archive_path, mode="rb") as target,
+            py7zr.SevenZipFile(target, "r", password=password) as archive,
+        ):
+            archive.extractall(path=dest)
     else:
         with py7zr.SevenZipFile(archive_path, "r", password=password) as archive:
             archive.extractall(path=dest)
@@ -141,6 +151,10 @@ class TestHashing:
         target.write_text("v1", encoding="utf-8")
         h1, err1 = compute_metadata_hash(get_all_paths([str(folder)]))
         target.write_text("v2", encoding="utf-8")
+        # Force mtime forward so metadata hash differs even on coarse-resolution FS
+        # (Windows CI often keeps the same st_mtime for two same-size writes).
+        forced_mtime = os.stat(target).st_mtime + 10
+        os.utime(target, (os.stat(target).st_atime, forced_mtime))
         h2, err2 = compute_metadata_hash(get_all_paths([str(folder)]))
         assert h1 != h2
         assert len(h1) == 64
@@ -207,7 +221,7 @@ class TestBackupIntegration:
         _extract_archive(dest / "secret_arc.7z", extracted, password="s3cret")
         assert (extracted / "src" / "secret.txt").read_text(encoding="utf-8") == "classified"
 
-        with pytest.raises(Exception):
+        with pytest.raises(_PASSWORD_FAILURES):
             _extract_archive(dest / "secret_arc.7z", tmp_path / "bad", password="wrong")
 
     def test_skips_backup_when_nothing_changed(self, tmp_path: Path):
@@ -438,9 +452,11 @@ class TestBackupIntegration:
         
         archive_path = dest / "secret_arc.7z"
         # Try to read without password - should fail because headers are encrypted
-        with pytest.raises(py7zr.exceptions.PasswordRequired):
-            with py7zr.SevenZipFile(archive_path, 'r') as archive:
-                archive.getnames()
+        with (
+            pytest.raises(py7zr.exceptions.PasswordRequired),
+            py7zr.SevenZipFile(archive_path, 'r') as archive,
+        ):
+            archive.getnames()
 
     def test_duplicate_archive_names_resolved(self, tmp_path: Path, capsys):
         src1 = tmp_path / "src1"
@@ -565,9 +581,11 @@ class TestBackupIntegration:
 
         (src / "f.txt").write_text("new", encoding="utf-8")
 
-        with patch("py7zr.SevenZipFile.writeall", side_effect=RuntimeError("compression failed")):
-            with pytest.raises(RuntimeError, match="compression failed"):
-                create_archive([str(src)], str(dest), "arc", None, None)
+        with (
+            patch("py7zr.SevenZipFile.writeall", side_effect=RuntimeError("compression failed")),
+            pytest.raises(RuntimeError, match="compression failed"),
+        ):
+            create_archive([str(src)], str(dest), "arc", None, None)
 
         assert (dest / "arc.7z").is_file()
         assert (dest / "arc.7z").read_bytes() == orig_content
@@ -661,7 +679,7 @@ class TestPasswordChangeDetection:
 
         # Extraction without password should fail
         out_fail = tmp_path / "out_fail"
-        with pytest.raises(Exception):
+        with pytest.raises(_PASSWORD_FAILURES):
             _extract_archive(dest / "pw_arc.7z", out_fail, password=None)
 
         # Extraction with correct password succeeds
@@ -687,7 +705,7 @@ class TestPasswordChangeDetection:
 
         # Old password should fail
         out_old = tmp_path / "out_old"
-        with pytest.raises(Exception):
+        with pytest.raises(_PASSWORD_FAILURES):
             _extract_archive(dest / "pw_arc.7z", out_old, password="pass_one")
 
         # New password should succeed
@@ -731,9 +749,11 @@ class TestArchiveValidationAndCleanup:
             (dest / "fail_arc.7z").write_bytes(b"corrupt partial archive data")
             raise RuntimeError("disk full during write")
 
-        with patch("backup.py7zr.SevenZipFile.writeall", side_effect=fail_write):
-            with pytest.raises(RuntimeError, match="disk full during write"):
-                create_archive([str(src)], str(dest), "fail_arc", None, None)
+        with (
+            patch("backup.py7zr.SevenZipFile.writeall", side_effect=fail_write),
+            pytest.raises(RuntimeError, match="disk full during write"),
+        ):
+            create_archive([str(src)], str(dest), "fail_arc", None, None)
 
         # Dest should be clean of partial files matching the archive pattern
         assert not (dest / "fail_arc.7z").exists()

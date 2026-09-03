@@ -8,10 +8,10 @@ import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any
 
 try:
-    from backup import run_backup, _validate_archive_name
+    from backup import _validate_archive_name, run_backup
 except ImportError as _exc:  # pragma: no cover - depends on runtime environment
     run_backup = None  # type: ignore[assignment]
     _IMPORT_ERROR = _exc
@@ -21,7 +21,7 @@ except ImportError as _exc:  # pragma: no cover - depends on runtime environment
         | {f"LPT{i}" for i in range(1, 10)}
     )
 
-    def _validate_archive_name(archive_name: str) -> Optional[str]:  # type: ignore[misc]
+    def _validate_archive_name(archive_name: str) -> str | None:  # type: ignore[misc]
         if not archive_name or archive_name in (".", ".."):
             return f"Archive name is empty or reserved: {archive_name!r}"
         if "\\" in archive_name or "/" in archive_name:
@@ -108,7 +108,7 @@ def _add_console_handlers(target: logging.Logger, level: int) -> None:
     target.addHandler(stderr_handler)
 
 
-def setup_logging(log_file: Optional[str] = None, log_level: Optional[int] = None, log_max_size: Optional[int] = None, log_backup_count: Optional[int] = None) -> logging.Logger:
+def setup_logging(log_file: str | None = None, log_level: int | None = None, log_max_size: int | None = None, log_backup_count: int | None = None) -> logging.Logger:
     """Configure console and optional rotating file logging."""
     level = DEFAULT_LOG_LEVEL if log_level is None else log_level
     backup_count = DEFAULT_LOG_BACKUP_COUNT if log_backup_count is None else log_backup_count
@@ -140,7 +140,7 @@ def setup_logging(log_file: Optional[str] = None, log_level: Optional[int] = Non
     return logger
 
 
-def parse_size(size_str: Optional[str]) -> Optional[int]:
+def parse_size(size_str: str | None) -> int | None:
     if not size_str:
         return None
     size_str = size_str.strip().lower()
@@ -228,10 +228,10 @@ def _get_boolean(parser: configparser.ConfigParser, section: str, option: str, c
 
 
 def _resolve_password(
-    cli_password: Optional[str] = None,
+    cli_password: str | None = None,
     section_password: Any = _UNSET,
-    global_password: Optional[str] = None,
-) -> Optional[str]:
+    global_password: str | None = None,
+) -> str | None:
     """Resolve the archive password with priority: CLI > section (explicit, incl. empty) > env > global.
 
     `section_password` uses the _UNSET sentinel to distinguish "option absent"
@@ -247,7 +247,7 @@ def _resolve_password(
     return global_password
 
 
-def execute_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str], check_content_hash: bool = False) -> bool:
+def execute_backup(sources: list[str], dest: str, archive_name: str, split_size: int | None, password: str | None, check_content_hash: bool = False) -> bool:
     if run_backup is None:
         logger.error(
             f"Error: required dependency missing ({_IMPORT_ERROR}). "
@@ -289,14 +289,14 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
             password=password,
             check_content_hash=check_content_hash
         )
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError) as e:
         logger.error(f"Backup failed: {e}")
         return False
 
     return True
 
 
-def parse_optional_size(value: Optional[str], context: str) -> Optional[int]:
+def parse_optional_size(value: str | None, context: str) -> int | None:
     if not value:
         return None
     val_clean = value.strip().lower()
@@ -308,7 +308,7 @@ def parse_optional_size(value: Optional[str], context: str) -> Optional[int]:
         raise ConfigError(f"{context}: {e}") from e
 
 
-def _apply_logging_config(global_parser: configparser.ConfigParser, section: Optional[str], overrides: Optional[dict[str, Any]]) -> None:
+def _apply_logging_config(global_parser: configparser.ConfigParser, section: str | None, overrides: dict[str, Any] | None) -> None:
     """Build logging settings from [GLOBAL] with optional CLI overrides.
 
     Raises ConfigError on invalid values.
@@ -359,10 +359,10 @@ def _apply_logging_config(global_parser: configparser.ConfigParser, section: Opt
 
 def run_from_config(
     config_path: str,
-    log_overrides: Optional[dict[str, Any]] = None,
+    log_overrides: dict[str, Any] | None = None,
     cli_check_content_hash: bool = False,
-    cli_password: Optional[str] = None,
-    cli_split: Optional[int] = None,
+    cli_password: str | None = None,
+    cli_split: int | None = None,
 ) -> bool:
     parser = configparser.ConfigParser(interpolation=None)
     try:

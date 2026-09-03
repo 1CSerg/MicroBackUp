@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 
+
 def _clean_build_dirs():
     root = os.path.dirname(os.path.abspath(__file__))
     for name in ("build", "dist"):
@@ -35,7 +36,7 @@ def run_build(name, noconsole=False):
         
     command.append("main.py")
     
-    result = subprocess.run(command)
+    result = subprocess.run(command, check=False)
     
     if result.returncode != 0:
         print(f"\n[{name}] Build failed.")
@@ -46,13 +47,13 @@ def run_build(name, noconsole=False):
 def ensure_dependencies():
     print("Checking dependencies...")
     try:
-        import PyInstaller  # noqa: F401
         import multivolumefile  # noqa: F401
         import py7zr  # noqa: F401
+        import PyInstaller  # noqa: F401
     except ImportError:
         req_build = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements-build.txt")
         print("Missing build dependencies. Installing from requirements-build.txt...")
-        result = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_build])
+        result = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_build], check=False)
         if result.returncode != 0:
             print("Failed to install dependencies.")
             sys.exit(result.returncode)
