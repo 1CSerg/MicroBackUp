@@ -47,9 +47,11 @@ def ensure_dependencies():
     print("Checking dependencies...")
     try:
         import PyInstaller  # noqa: F401
+        import multivolumefile  # noqa: F401
+        import py7zr  # noqa: F401
     except ImportError:
         req_build = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements-build.txt")
-        print("PyInstaller is not installed. Installing build dependencies from requirements-build.txt...")
+        print("Missing build dependencies. Installing from requirements-build.txt...")
         result = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_build])
         if result.returncode != 0:
             print("Failed to install dependencies.")
@@ -63,11 +65,15 @@ def build():
     # 1. Сборка консольной версии
     run_build("MicroBackUp", noconsole=False)
     
-    # 2. Сборка фоновой версии (без консоли)
-    run_build("MicroBackUp-bg", noconsole=True)
+    # 2. Сборка фоновой версии (без консоли, только Windows)
+    if os.name == 'nt':
+        run_build("MicroBackUp-bg", noconsole=True)
     
     print("\nAll builds completed successfully!")
-    print("Executables (MicroBackUp.exe and MicroBackUp-bg.exe) can be found in the 'dist' folder.")
+    if os.name == 'nt':
+        print("Executables (MicroBackUp.exe and MicroBackUp-bg.exe) can be found in the 'dist' folder.")
+    else:
+        print("Executable (MicroBackUp) can be found in the 'dist' folder.")
 
 if __name__ == "__main__":
     build()

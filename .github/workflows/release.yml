@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build:
     strategy:
       fail-fast: true
       matrix:
@@ -31,7 +31,7 @@ jobs:
           python -m pip install -r requirements-build.txt
 
       - name: Lint with ruff
-        run: ruff check .
+        run: python -m ruff check .
 
       - name: Run tests
         run: python -m pytest
@@ -39,12 +39,18 @@ jobs:
       - name: Build executables
         run: python build.py
 
-      - name: Rename Linux binaries (Linux only)
+      - name: Rename Linux binary (Linux only)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
           mv dist/MicroBackUp dist/MicroBackUp-linux
-          mv dist/MicroBackUp-bg dist/MicroBackUp-bg-linux
+
+      - name: Upload Linux artifact (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/MicroBackUp-linux
 
       - name: Pack Python distribution (Windows only)
         if: matrix.os == 'windows-latest'
@@ -58,9 +64,31 @@ jobs:
             "backup.py",
             "README.md",
             "MicroBackUp.conf.example",
-            "requirements.txt"
+            "requirements.txt",
+            "LICENSE"
           ) -Destination $dir
           Compress-Archive -Path $dir -DestinationPath "dist/$dir.zip" -Force
+
+      - name: Upload Windows artifacts (Windows only)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: |
+            dist/MicroBackUp.exe
+            dist/MicroBackUp-bg.exe
+            dist/MicroBackUp-*-python.zip
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -70,5 +98,4 @@ jobs:
             dist/MicroBackUp.exe
             dist/MicroBackUp-bg.exe
             dist/MicroBackUp-linux
-            dist/MicroBackUp-bg-linux
             dist/MicroBackUp-*-python.zip

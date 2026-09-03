@@ -30,3 +30,13 @@ Thumbs.db
 
 # Local config (may contain secrets). Use MicroBackUp.conf.example as a template.
 MicroBackUp.conf
+
+# Logs
+*.log
+*.log.*
+
+# Backup archives and metadata
+*.7z
+*.7z.*
+*_hash.json
+

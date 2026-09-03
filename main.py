@@ -59,6 +59,10 @@ class _CurrentStreamHandler(logging.StreamHandler):
         self.stream = getattr(sys, self._stream_name)
         super().emit(record)
 
+    def flush(self) -> None:
+        self.stream = getattr(sys, self._stream_name)
+        super().flush()
+
 
 def _clear_handlers(target: logging.Logger) -> None:
     for handler in list(target.handlers):
@@ -93,19 +97,22 @@ def setup_logging(log_file: Optional[str] = None, log_level: Optional[int] = Non
 
     if log_file:
         log_path = Path(log_file)
-        if log_path.parent and str(log_path.parent) not in ("", "."):
-            log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if log_path.parent and str(log_path.parent) not in ("", "."):
+                log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        max_bytes = log_max_size or 0
-        file_handler = RotatingFileHandler(
-            log_path,
-            maxBytes=max_bytes,
-            backupCount=backup_count,
-            encoding="utf-8",
-        )
-        file_handler.setLevel(level)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-        logger.addHandler(file_handler)
+            max_bytes = log_max_size or 0
+            file_handler = RotatingFileHandler(
+                log_path,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(level)
+            file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+            logger.addHandler(file_handler)
+        except OSError as e:
+            raise ConfigError(f"Could not initialize log file '{log_file}': {e}") from e
 
     return logger
 
@@ -231,8 +238,8 @@ def _validate_archive_name(archive_name: str) -> Optional[str]:
     # Reject path separators and traversal segments.
     if "\\" in archive_name or "/" in archive_name:
         return f"Archive name must not contain path separators: {archive_name!r}"
-    # Reject Windows-invalid filename characters.
-    if re.search(r'[<>:"|?*]', archive_name):
+    # Reject Windows-invalid filename characters and non-printable control characters.
+    if re.search(r'[\x00-\x1f<>:"|?*]', archive_name):
         return f"Archive name contains forbidden characters: {archive_name!r}"
     # Windows silently strips trailing dots and spaces; reject them so the
     # on-disk name matches what the user asked for.
@@ -252,6 +259,10 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
             f"Error: required dependency missing ({_IMPORT_ERROR}). "
             f"Install runtime dependencies: pip install -r requirements.txt"
         )
+        return False
+
+    if not sources:
+        logger.error("Error: Sources list is empty")
         return False
 
     name_error = _validate_archive_name(archive_name)
@@ -345,7 +356,12 @@ def _apply_logging_config(global_parser: configparser.ConfigParser, section: Opt
     )
 
 
-def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = None, cli_check_content_hash: bool = False) -> bool:
+def run_from_config(
+    config_path: str,
+    log_overrides: Optional[dict[str, Any]] = None,
+    cli_check_content_hash: bool = False,
+    cli_password: Optional[str] = None,
+) -> bool:
     parser = configparser.ConfigParser(interpolation=None)
     try:
         with open(config_path, encoding='utf-8') as f:
@@ -428,7 +444,7 @@ def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = 
             section_password = parser.get(section, 'password').strip() or None
         else:
             section_password = _UNSET
-        password = _resolve_password(None, section_password, global_password)
+        password = _resolve_password(cli_password, section_password, global_password)
 
         if parser.has_option(section, 'check_content_hash'):
             try:
@@ -544,15 +560,12 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Скрываем окно консоли в Windows, если запрошено
-    if args.hide:
-        if os.name == 'nt':
-            import ctypes
-            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-            if hwnd:
-                ctypes.windll.user32.ShowWindow(hwnd, 0)
-        else:
-            logger.info("--hide is supported only on Windows; ignored on this platform.")
+    # Скрываем окно консоли в Windows сразу, чтобы не мелькало
+    if args.hide and os.name == 'nt':
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
 
     try:
         log_overrides = _cli_log_overrides(args)
@@ -564,16 +577,30 @@ def main() -> None:
         if not os.path.exists(args.config):
             logger.error(f"Error: Config file does not exist: {args.config}")
             sys.exit(1)
-        if not run_from_config(args.config, log_overrides=log_overrides, cli_check_content_hash=args.check_content_hash):
+        if args.hide and os.name != 'nt':
+            logger.info("--hide is supported only on Windows; ignored on this platform.")
+        if not run_from_config(
+            args.config,
+            log_overrides=log_overrides,
+            cli_check_content_hash=args.check_content_hash,
+            cli_password=args.password,
+        ):
             sys.exit(1)
         return
 
-    setup_logging(
-        log_file=log_overrides.get("log_file"),
-        log_level=log_overrides.get("log_level"),
-        log_max_size=log_overrides.get("log_max_size"),
-        log_backup_count=log_overrides.get("log_backup_count"),
-    )
+    try:
+        setup_logging(
+            log_file=log_overrides.get("log_file"),
+            log_level=log_overrides.get("log_level"),
+            log_max_size=log_overrides.get("log_max_size"),
+            log_backup_count=log_overrides.get("log_backup_count"),
+        )
+    except ConfigError as e:
+        logger.error(f"Error: {e}")
+        sys.exit(1)
+
+    if args.hide and os.name != 'nt':
+        logger.info("--hide is supported only on Windows; ignored on this platform.")
 
     if not args.sources or not args.dest or not args.name:
         parser.error("the following arguments are required: -s/--sources, -d/--dest, -n/--name (or use -c/--config)")

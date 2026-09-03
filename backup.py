@@ -125,8 +125,9 @@ def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[s
         return None, True
     return hasher.hexdigest(), False
 
-def create_archive(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str]) -> None:
+def create_archive(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str]) -> list[str]:
     dest_path = Path(dest)
+    dest_path.mkdir(parents=True, exist_ok=True)
     archive_path = dest_path / f"{archive_name}.7z"
     
     logger.info(f"Creating archive: {archive_path}")
@@ -136,7 +137,7 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
     def add_to_archive(archive, src_path):
         arcname = src_path.name
         if arcname in seen_arcnames:
-            logger.error(f"Duplicate archive name detected: '{arcname}' for path '{src_path}'.")
+            logger.warning(f"Duplicate archive name detected: '{arcname}' for path '{src_path}'.")
             original_arcname = arcname
             stem, dot, suffix = original_arcname.partition(".")
             counter = 1
@@ -189,6 +190,14 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             
         logger.info("Archive created successfully.")
+
+        single_file = dest_path / f"{archive_name}.7z"
+        if single_file.is_file():
+            return [single_file.name]
+
+        vol_pattern = re.compile(rf"^{re.escape(archive_name)}\.7z\.(\d+)$")
+        created = [p.name for p in dest_path.iterdir() if p.is_file() and vol_pattern.match(p.name)]
+        return sorted(created, key=lambda n: int(vol_pattern.match(n).group(1)))  # type: ignore[union-attr]
     except Exception:
         if temp_dir:
             logger.info("Archive creation failed, restoring old archive files")
@@ -208,12 +217,49 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
                 pass
         raise
 
+def _check_archive_exists(dest_path: Path, archive_name: str, old_info: dict) -> bool:
+    """Check that all required archive volumes exist on disk."""
+    if "volumes" in old_info:
+        volumes = old_info["volumes"]
+        if not isinstance(volumes, list) or not volumes:
+            return False
+        for vol in volumes:
+            if not isinstance(vol, str) or not vol or Path(vol).name != vol:
+                return False
+        return all((dest_path / vol).is_file() for vol in volumes)
+
+    # Legacy fallback for info files created without 'volumes'
+    old_split = old_info.get("split_size")
+    if old_split is None:
+        return (dest_path / f"{archive_name}.7z").is_file()
+
+    pattern = re.compile(rf"^{re.escape(archive_name)}\.7z\.(\d+)$")
+    parts = []
+    for p in dest_path.iterdir():
+        if p.is_file():
+            m = pattern.match(p.name)
+            if m:
+                parts.append(int(m.group(1)))
+    if not parts:
+        return False
+    parts.sort()
+    return parts[0] == 1 and parts == list(range(1, len(parts) + 1))
+
+
 def _atomic_write_json(path: Path, data: dict) -> None:
     """Write JSON to path atomically via a temp file + os.replace."""
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int] = None, password: Optional[str] = None, check_content_hash: bool = False) -> None:
@@ -229,21 +275,20 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Opt
     names_hash = None
     metadata_hash = None
     content_hash = None
-    
-    if info_file.exists():
-        archive_path = Path(dest) / f"{archive_name}.7z"
-        archive_exists = archive_path.exists()
-        if not archive_exists:
-            pattern = re.compile(rf"^{re.escape(archive_name)}\.7z\.\d+$")
-            archive_exists = any(p.is_file() and pattern.match(p.name) for p in Path(dest).iterdir())
-            
-        if not archive_exists:
-            logger.info("Archive file(s) not found on disk. Will perform full backup.")
-        else:
-            try:
-                with open(info_file, 'r', encoding='utf-8') as f:
-                    old_info = json.load(f)
+    old_info = None
 
+    if info_file.exists():
+        try:
+            with open(info_file, 'r', encoding='utf-8') as f:
+                old_info = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.error(f"Error reading info file {info_file}: {e}. Will perform full backup.")
+            old_info = None
+
+        if old_info is not None:
+            if not _check_archive_exists(Path(dest), archive_name, old_info):
+                logger.info("Archive file(s) not found on disk. Will perform full backup.")
+            else:
                 logger.info("Checking state against previous backup...")
 
                 # Check split format change first: if the requested split_size
@@ -289,9 +334,6 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Opt
                             logger.info("Names hash differs.")
                     else:
                         logger.info("Counts differ.")
-
-            except (OSError, ValueError) as e:
-                logger.error(f"Error reading info file {info_file}: {e}. Will perform full backup.")
     else:
         logger.info("No previous backup info found. Will perform full backup.")
 
@@ -307,7 +349,7 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Opt
             logger.info("Computing content hash...")
             content_hash, _ = compute_content_hash(all_paths)
 
-        create_archive(sources, dest, archive_name, split_size, password)
+        created_volumes = create_archive(sources, dest, archive_name, split_size, password)
 
         now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -317,6 +359,7 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Opt
             'names_hash': names_hash,
             'metadata_hash': metadata_hash,
             'split_size': split_size,
+            'volumes': created_volumes,
             'last_check_date': now_str,
             'last_update_date': now_str
         }

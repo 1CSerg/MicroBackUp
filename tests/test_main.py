@@ -63,6 +63,12 @@ class TestParseSize:
         with pytest.raises(argparse.ArgumentTypeError, match="Size must be strictly positive"):
             parse_size("0")
 
+    def test_vanishingly_small_size_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="rounds to 0 bytes"):
+            parse_size("0.0000000001")
+        with pytest.raises(argparse.ArgumentTypeError, match="rounds to 0 bytes"):
+            parse_size("0.000001k")
+
 
 class TestParseSources:
     def test_simple_paths(self):
@@ -126,8 +132,28 @@ class TestValidateArchiveName:
         assert _validate_archive_name(".") is not None
         assert _validate_archive_name("..") is not None
 
+    def test_control_chars_rejected(self):
+        from main import _validate_archive_name
+        assert _validate_archive_name("test\x00name") is not None
+        assert _validate_archive_name("test\x1fname") is not None
+        assert _validate_archive_name("test\nname") is not None
+
 
 class TestExecuteBackup:
+    def test_empty_sources_returns_false(self, tmp_path, capsys):
+        dest = tmp_path / "dest"
+        ok = execute_backup([], str(dest), "arc", None, None)
+        assert ok is False
+        assert "Sources list is empty" in capsys.readouterr().err
+
+    def test_invalid_archive_name_returns_false(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        dest = tmp_path / "dest"
+        ok = execute_backup([str(src)], str(dest), "bad:name", None, None)
+        assert ok is False
+        assert "forbidden characters" in capsys.readouterr().err
+
     def test_missing_source_returns_false(self, tmp_path, capsys):
         missing = tmp_path / "no_such_dir"
         dest = tmp_path / "dest"
@@ -588,6 +614,27 @@ class TestResolvePassword:
         assert ok is True
         assert captured == ["glob"]
 
+    def test_cli_password_overrides_config_job(self, tmp_path):
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(password)
+            return True
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._conf(
+            tmp_path / "cli_override.conf",
+            f"[GLOBAL]\npassword = glob\n\n[Job]\nsources = {src}\ndest = {dest}\nname = n\npassword = sec\n",
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf), cli_password="cli_override")
+        assert ok is True
+        assert captured == ["cli_override"]
+
+
 
 class TestMainCli:
     def test_missing_required_args(self, monkeypatch):
@@ -625,6 +672,31 @@ class TestMainCli:
         monkeypatch.setattr(sys, "argv", ["main.py", "-c", str(conf)])
         main()
         assert (dest / "from_cli.7z").is_file()
+
+    def test_cli_password_with_config_invokes_backup_with_cli_password(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = tmp_path / "pw.conf"
+        conf.write_text(
+            f"[GLOBAL]\npassword = glob\n\n[Job]\nsources = {src}\ndest = {dest}\nname = arc\npassword = sec\n",
+            encoding="utf-8",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(password)
+            return True
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["main.py", "-c", str(conf), "-p", "cli_master_key"],
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            main()
+        assert captured == ["cli_master_key"]
 
     def test_cli_args_success(self, tmp_path, monkeypatch):
         src = tmp_path / "src"
@@ -779,6 +851,28 @@ class TestMainCli:
             main()
         assert exc.value.code == 2
 
+    def test_cli_unwriteable_log_file_exits(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "-s", str(src),
+                "-d", str(dest),
+                "-n", "cli_arc",
+                "--log-file", str(tmp_path / "bad.log"),
+            ],
+        )
+        with patch("main.setup_logging", side_effect=ConfigError("Failed to open log")):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 1
+        assert "Failed to open log" in capsys.readouterr().err
+
 
 class TestLogHelpers:
     def test_parse_log_level_default(self):
@@ -920,3 +1014,15 @@ name = logged
             main()
         assert exc.value.code == 1
         assert "invalid log level" in capsys.readouterr().err
+
+    def test_setup_logging_oserror_raises_config_error(self, tmp_path):
+        with patch("main.RotatingFileHandler", side_effect=OSError("Permission denied")):
+            with pytest.raises(ConfigError, match="Could not initialize log file"):
+                setup_logging(log_file=str(tmp_path / "denied.log"))
+
+    def test_current_stream_handler_flush(self):
+        from main import _CurrentStreamHandler
+        handler = _CurrentStreamHandler("stdout")
+        with patch.object(sys.stdout, "flush") as mock_flush:
+            handler.flush()
+            mock_flush.assert_called_once()

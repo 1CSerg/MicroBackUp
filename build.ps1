@@ -20,7 +20,7 @@ function Find-Python {
 
 $python = Find-Python
 if (-not $python) {
-    Write-Host "Python не найден. Установите Python 3.8+ и добавьте его в PATH." -ForegroundColor Red
+    Write-Host "Python не найден. Установите Python 3.10+ и добавьте его в PATH." -ForegroundColor Red
     Read-Host -Prompt "Press Enter to exit"
     exit 1
 }

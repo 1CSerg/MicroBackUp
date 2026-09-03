@@ -19,24 +19,25 @@
 
 GitHub [Release](https://github.com/1CSerg/MicroBackUp/releases):
 
-- `MicroBackUp.exe` — консольная сборка
-- `MicroBackUp-bg.exe` — фоновая сборка без окна консоли
+- `MicroBackUp.exe` — консольная сборка (Windows)
+- `MicroBackUp-bg.exe` — фоновая сборка без окна консоли (Windows)
+- `MicroBackUp-linux` — бинарная сборка для Linux
 - `MicroBackUp-v1.0.0-python.zip` — исходники и `requirements.txt` (без PyInstaller)
 
 ## Сборка в исполняемые файлы (EXE)
 
 Для создания независимых исполняемых файлов на Windows используйте скрипт сборки. Вы можете запустить его двумя способами:
 
-1. Двойным кликом по файлу `build.ps1` (если в Windows разрешен запуск PowerShell-скриптов) или через консоль:
-   ```powershell
-   .\build.ps1
+1. Двойным кликом по файлу `build.bat` (или `build.ps1`, если в Windows разрешен запуск PowerShell-скриптов) либо через консоль:
+   ```cmd
+   build.bat
    ```
 2. Либо напрямую через Python:
    ```bash
    python build.py
    ```
 
-`build.ps1` сам ставит зависимости из `requirements-build.txt` (runtime-пакеты и `PyInstaller`) и запускает сборку. При запуске через `python build.py` недостающий `PyInstaller` тоже ставится автоматически.
+`build.bat` и `build.ps1` сами ставят зависимости из `requirements-build.txt` (runtime-пакеты и `PyInstaller`) и запускают сборку. При запуске через `python build.py` недостающий `PyInstaller` тоже ставится автоматически.
 После успешной сборки в папке `dist` появятся два файла:
 1. `MicroBackUp.exe` — стандартная версия. При запуске открывает окно консоли, где виден прогресс и возможные ошибки. Удобна для ручного запуска.
 2. `MicroBackUp-bg.exe` — фоновая ("тихая") версия. Окно консоли не появляется вообще. Идеально подходит для запуска бэкапов по расписанию через планировщик задач. Рекомендуется запускать с `-c` и заданным `log_file`, иначе ход работы нигде не будет виден.

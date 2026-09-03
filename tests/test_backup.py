@@ -378,6 +378,38 @@ class TestBackupIntegration:
         assert info2["content_hash"] != info1["content_hash"]
         assert info2["last_update_date"] != info1["last_update_date"]
 
+        # Run again with content unchanged
+        run_backup([str(src)], str(dest), "inc", check_content_hash=True)
+        info3 = json.loads((dest / "inc_hash.json").read_text(encoding="utf-8"))
+        assert info3["content_hash"] == info2["content_hash"]
+        assert info3["last_update_date"] == info2["last_update_date"]
+
+    def test_meta_error_in_run_backup_forces_full_backup(self, tmp_path: Path, capsys):
+        from unittest.mock import patch
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("data", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "inc")
+        with patch("backup.compute_metadata_hash", return_value=(None, True)):
+            run_backup([str(src)], str(dest), "inc")
+        assert "Metadata read error detected. Will perform full backup." in capsys.readouterr().out
+
+    def test_content_error_in_run_backup_forces_full_backup(self, tmp_path: Path, capsys):
+        from unittest.mock import patch
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("data", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "inc", check_content_hash=True)
+        with patch("backup.compute_content_hash", return_value=(None, True)):
+            run_backup([str(src)], str(dest), "inc", check_content_hash=True)
+        assert "Content read error detected. Will perform full backup." in capsys.readouterr().out
+
     def test_missing_archive_triggers_rebuild(self, tmp_path: Path, capsys):
         src = tmp_path / "src"
         src.mkdir()
@@ -457,3 +489,147 @@ class TestBackupIntegration:
         info2 = json.loads((dest / "fmt_hash.json").read_text(encoding="utf-8"))
         assert info2["split_size"] == 8192
         assert "Split size changed" in capsys.readouterr().out
+
+    def test_missing_split_volume_triggers_rebuild(self, tmp_path: Path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        payload = os.urandom(80_000)
+        (src / "big.bin").write_bytes(payload)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        volume = 16_384
+
+        run_backup([str(src)], str(dest), "split_arc", split_size=volume)
+        info1 = json.loads((dest / "split_arc_hash.json").read_text(encoding="utf-8"))
+        assert "volumes" in info1
+        assert len(info1["volumes"]) >= 2
+        
+        # Delete one of the volume files (e.g. the second one)
+        vol_to_delete = dest / info1["volumes"][1]
+        assert vol_to_delete.is_file()
+        vol_to_delete.unlink()
+
+        # Run backup again without changing source
+        run_backup([str(src)], str(dest), "split_arc", split_size=volume)
+        captured = capsys.readouterr().out
+        assert "Archive file(s) not found on disk. Will perform full backup." in captured
+        assert vol_to_delete.is_file()
+
+    def test_legacy_split_archive_detects_gap_and_rebuilds(self, tmp_path: Path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        payload = os.urandom(80_000)
+        (src / "big.bin").write_bytes(payload)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        volume = 16_384
+
+        run_backup([str(src)], str(dest), "split_arc", split_size=volume)
+        info_file = dest / "split_arc_hash.json"
+        info = json.loads(info_file.read_text(encoding="utf-8"))
+        # Remove 'volumes' to simulate a hash file written by an older version
+        del info["volumes"]
+        info_file.write_text(json.dumps(info), encoding="utf-8")
+
+        # Delete the first volume
+        first_vol = dest / "split_arc.7z.0001"
+        assert first_vol.is_file()
+        first_vol.unlink()
+
+        # Run backup again; missing 0001 should be detected by the legacy fallback
+        run_backup([str(src)], str(dest), "split_arc", split_size=volume)
+        captured = capsys.readouterr().out
+        assert "Archive file(s) not found on disk. Will perform full backup." in captured
+        assert first_vol.is_file()
+
+    def test_create_archive_creates_missing_destination(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+        dest = tmp_path / "nested" / "dest"
+        assert not dest.exists()
+
+        create_archive([str(src)], str(dest), "arc", None, None)
+        assert (dest / "arc.7z").is_file()
+
+    def test_create_archive_rollback_on_failure(self, tmp_path: Path):
+        from unittest.mock import patch
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("orig", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        create_archive([str(src)], str(dest), "arc", None, None)
+        orig_content = (dest / "arc.7z").read_bytes()
+
+        (src / "f.txt").write_text("new", encoding="utf-8")
+
+        with patch("py7zr.SevenZipFile.writeall", side_effect=RuntimeError("compression failed")):
+            with pytest.raises(RuntimeError, match="compression failed"):
+                create_archive([str(src)], str(dest), "arc", None, None)
+
+        assert (dest / "arc.7z").is_file()
+        assert (dest / "arc.7z").read_bytes() == orig_content
+
+    def test_duplicate_source_names_without_extension(self, tmp_path: Path):
+        src1 = tmp_path / "src1" / "folder"
+        src1.mkdir(parents=True)
+        (src1 / "a.txt").write_text("one", encoding="utf-8")
+
+        src2 = tmp_path / "src2" / "folder"
+        src2.mkdir(parents=True)
+        (src2 / "b.txt").write_text("two", encoding="utf-8")
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        create_archive([str(src1), str(src2)], str(dest), "dup_dir", None, None)
+        assert (dest / "dup_dir.7z").is_file()
+
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "dup_dir.7z", extracted)
+        assert (extracted / "folder" / "a.txt").read_text(encoding="utf-8") == "one"
+        assert (extracted / "folder_1" / "b.txt").read_text(encoding="utf-8") == "two"
+
+    def test_atomic_write_json_cleans_tmp_on_error(self, tmp_path: Path):
+        from backup import _atomic_write_json
+        target = tmp_path / "test.json"
+        with pytest.raises(TypeError):
+            _atomic_write_json(target, {"bad": object()})
+        assert not target.exists()
+        assert not target.with_suffix(".json.tmp").exists()
+
+
+class TestCheckArchiveExists:
+    def test_empty_or_invalid_volumes_list_returns_false(self, tmp_path: Path):
+        from backup import _check_archive_exists
+        assert _check_archive_exists(tmp_path, "arc", {"volumes": []}) is False
+        assert _check_archive_exists(tmp_path, "arc", {"volumes": "not-a-list"}) is False
+
+    def test_legacy_non_split_fallback(self, tmp_path: Path):
+        from backup import _check_archive_exists
+        arc = tmp_path / "arc.7z"
+        assert _check_archive_exists(tmp_path, "arc", {"split_size": None}) is False
+        arc.write_text("x", encoding="utf-8")
+        assert _check_archive_exists(tmp_path, "arc", {"split_size": None}) is True
+
+    def test_legacy_split_no_parts_returns_false(self, tmp_path: Path):
+        from backup import _check_archive_exists
+        assert _check_archive_exists(tmp_path, "arc", {"split_size": 1000}) is False
+
+    def test_legacy_split_wrong_start_returns_false(self, tmp_path: Path):
+        from backup import _check_archive_exists
+        (tmp_path / "arc.7z.0002").write_text("x", encoding="utf-8")
+        assert _check_archive_exists(tmp_path, "arc", {"split_size": 1000}) is False
+
+    def test_volumes_with_path_traversal_returns_false(self, tmp_path: Path):
+        from backup import _check_archive_exists
+        assert _check_archive_exists(tmp_path, "arc", {"volumes": ["../evil.7z"]}) is False
+        assert _check_archive_exists(tmp_path, "arc", {"volumes": ["sub/vol.7z"]}) is False
+
+    def test_volumes_with_non_string_elements_returns_false(self, tmp_path: Path):
+        from backup import _check_archive_exists
+        assert _check_archive_exists(tmp_path, "arc", {"volumes": [123, None]}) is False
+
+
