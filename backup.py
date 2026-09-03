@@ -8,6 +8,7 @@ import logging
 import py7zr
 import multivolumefile
 import re
+import secrets
 import shutil
 import tempfile
 from pathlib import Path
@@ -16,6 +17,40 @@ from typing import Optional
 logger = logging.getLogger("microbackup")
 
 CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB chunk size for hashing
+
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _validate_archive_name(archive_name: str) -> Optional[str]:
+    """Return an error message if archive_name is unsafe, else None."""
+    if not archive_name or archive_name in (".", ".."):
+        return f"Archive name is empty or reserved: {archive_name!r}"
+    # Reject path separators and traversal segments.
+    if "\\" in archive_name or "/" in archive_name:
+        return f"Archive name must not contain path separators: {archive_name!r}"
+    # Reject Windows-invalid filename characters and non-printable control characters.
+    if re.search(r'[\x00-\x1f<>:"|?*]', archive_name):
+        return f"Archive name contains forbidden characters: {archive_name!r}"
+    # Windows silently strips trailing dots and spaces; reject them so the
+    # on-disk name matches what the user asked for.
+    if archive_name != archive_name.rstrip(". "):
+        return f"Archive name must not end with dots or spaces: {archive_name!r}"
+    # Reject Windows-reserved device names (case-insensitive, with or without
+    # extension).
+    stem = archive_name.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        return f"Archive name is a reserved device name: {archive_name!r}"
+    return None
+
+
+def _hash_password(password: str, salt: str) -> str:
+    """Compute a salted hash of the password for change detection."""
+    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+
 
 def get_all_paths(sources: list[str]) -> list[tuple[str, str, str]]:
     """
@@ -97,7 +132,8 @@ def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[st
         f_hash = compute_file_hash(abs_path)
         if f_hash.startswith("ERROR:"):
             had_error = True
-        hasher.update(f_hash.encode('utf-8'))
+        norm_rel = rel_path.replace('\\', '/')
+        hasher.update(f"{norm_rel}:{f_hash}".encode('utf-8'))
     # On any read error the digest is not trustworthy as a content fingerprint:
     # return None so run_backup forces a full backup and doesn't persist a
     # hash that mixes error markers with real data.
@@ -126,6 +162,10 @@ def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[s
     return hasher.hexdigest(), False
 
 def create_archive(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str]) -> list[str]:
+    name_error = _validate_archive_name(archive_name)
+    if name_error:
+        raise ValueError(f"Invalid archive_name: {name_error}")
+
     dest_path = Path(dest)
     dest_path.mkdir(parents=True, exist_ok=True)
     archive_path = dest_path / f"{archive_name}.7z"
@@ -199,16 +239,18 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
         created = [p.name for p in dest_path.iterdir() if p.is_file() and vol_pattern.match(p.name)]
         return sorted(created, key=lambda n: int(vol_pattern.match(n).group(1)))  # type: ignore[union-attr]
     except Exception:
-        if temp_dir:
-            logger.info("Archive creation failed, restoring old archive files")
-            # Remove any partial new archive files (including extra split volumes
-            # that the failed run may have created beyond what the old set had).
+        # Remove any partial new archive files (including extra split volumes
+        # that the failed run may have created).
+        if dest_path.exists():
             for p in dest_path.iterdir():
                 if p.is_file() and pattern.match(p.name):
                     try:
                         p.unlink()
                     except OSError as e:
                         logger.warning(f"Could not remove partial archive file {p}: {e}")
+
+        if temp_dir:
+            logger.info("Archive creation failed, restoring old archive files")
             for p in Path(temp_dir).iterdir():
                 shutil.move(str(p), str(dest_path / p.name))
             try:
@@ -263,6 +305,10 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 
 
 def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int] = None, password: Optional[str] = None, check_content_hash: bool = False) -> None:
+    name_error = _validate_archive_name(archive_name)
+    if name_error:
+        raise ValueError(f"Invalid archive_name: {name_error}")
+
     info_file = Path(dest) / f"{archive_name}_hash.json"
     
     logger.info("Gathering file list...")
@@ -295,11 +341,24 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Opt
                 # differs from the previous run, the archive layout changes and
                 # we must rebuild regardless of content hashes.
                 old_split = old_info.get('split_size')
+                old_has_password = old_info.get('has_password')
+                curr_has_password = bool(password)
+
                 if old_split != split_size:
                     logger.info(
                         f"Split size changed (was {old_split}, now {split_size}). "
                         f"Will perform full backup."
                     )
+                elif old_has_password is not None and old_has_password != curr_has_password:
+                    logger.info("Password protection setting changed. Will perform full backup.")
+                elif old_has_password is None and curr_has_password:
+                    logger.info("Password protection added to legacy backup. Will perform full backup.")
+                elif curr_has_password and (
+                    not old_info.get('password_salt')
+                    or not old_info.get('password_hash')
+                    or _hash_password(password, old_info['password_salt']) != old_info['password_hash']
+                ):
+                    logger.info("Password changed. Will perform full backup.")
                 else:
                     # Step 1: Check counts
                     if old_info.get('files_count') == files_count and old_info.get('dirs_count') == dirs_count:
@@ -339,35 +398,52 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Opt
 
     if need_backup:
         # Compute hashes if not already computed during checks
+        meta_error = False
+        content_error = False
+
         if names_hash is None:
             logger.info("Computing names hash...")
             names_hash = compute_names_hash(all_paths)
         if metadata_hash is None:
             logger.info("Computing metadata hash...")
-            metadata_hash, _ = compute_metadata_hash(all_paths)
+            metadata_hash, meta_error = compute_metadata_hash(all_paths)
         if check_content_hash and content_hash is None:
             logger.info("Computing content hash...")
-            content_hash, _ = compute_content_hash(all_paths)
+            content_hash, content_error = compute_content_hash(all_paths)
 
         created_volumes = create_archive(sources, dest, archive_name, split_size, password)
 
-        now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        if meta_error or metadata_hash is None or (check_content_hash and (content_error or content_hash is None)):
+            logger.error("Error computing hashes due to read/stat failure. Skipping hash file creation.")
+            if info_file.exists():
+                try:
+                    info_file.unlink()
+                except OSError:
+                    pass
+        else:
+            now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            has_password = bool(password)
 
-        new_info = {
-            'files_count': files_count,
-            'dirs_count': dirs_count,
-            'names_hash': names_hash,
-            'metadata_hash': metadata_hash,
-            'split_size': split_size,
-            'volumes': created_volumes,
-            'last_check_date': now_str,
-            'last_update_date': now_str
-        }
-        if check_content_hash:
-            new_info['content_hash'] = content_hash
+            new_info = {
+                'files_count': files_count,
+                'dirs_count': dirs_count,
+                'names_hash': names_hash,
+                'metadata_hash': metadata_hash,
+                'split_size': split_size,
+                'volumes': created_volumes,
+                'has_password': has_password,
+                'last_check_date': now_str,
+                'last_update_date': now_str
+            }
+            if has_password and password:
+                salt = secrets.token_hex(16)
+                new_info['password_salt'] = salt
+                new_info['password_hash'] = _hash_password(password, salt)
+            if check_content_hash:
+                new_info['content_hash'] = content_hash
 
-        _atomic_write_json(info_file, new_info)
-        logger.info(f"Updated info file: {info_file}")
+            _atomic_write_json(info_file, new_info)
+            logger.info(f"Updated info file: {info_file}")
 
     else:
         # Just update the check date

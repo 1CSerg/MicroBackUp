@@ -633,3 +633,161 @@ class TestCheckArchiveExists:
         assert _check_archive_exists(tmp_path, "arc", {"volumes": [123, None]}) is False
 
 
+class TestPasswordChangeDetection:
+    def test_adding_password_triggers_rebuild(self, source_tree: Path, tmp_path: Path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        sources = [str(source_tree / "single.txt")]
+
+        run_backup(sources, str(dest), "pw_arc", password=None)
+        info_file = dest / "pw_arc_hash.json"
+        assert info_file.is_file()
+        info1 = json.loads(info_file.read_text(encoding="utf-8"))
+        assert info1.get("has_password") is False
+        assert "password_hash" not in info1
+
+        # Unencrypted archive can be extracted without password
+        out1 = tmp_path / "out1"
+        _extract_archive(dest / "pw_arc.7z", out1, password=None)
+        assert (out1 / "single.txt").read_text(encoding="utf-8") == "file"
+
+        # Now run backup with password -> must rebuild archive with encryption
+        run_backup(sources, str(dest), "pw_arc", password="secret_password")
+        info2 = json.loads(info_file.read_text(encoding="utf-8"))
+        assert info2.get("has_password") is True
+        assert "password_hash" in info2
+        assert "password_salt" in info2
+        assert info2["last_update_date"] != info1["last_update_date"]
+
+        # Extraction without password should fail
+        out_fail = tmp_path / "out_fail"
+        with pytest.raises(Exception):
+            _extract_archive(dest / "pw_arc.7z", out_fail, password=None)
+
+        # Extraction with correct password succeeds
+        out2 = tmp_path / "out2"
+        _extract_archive(dest / "pw_arc.7z", out2, password="secret_password")
+        assert (out2 / "single.txt").read_text(encoding="utf-8") == "file"
+
+    def test_changing_password_triggers_rebuild(self, source_tree: Path, tmp_path: Path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        sources = [str(source_tree / "single.txt")]
+
+        run_backup(sources, str(dest), "pw_arc", password="pass_one")
+        info_file = dest / "pw_arc_hash.json"
+        info1 = json.loads(info_file.read_text(encoding="utf-8"))
+        assert info1.get("has_password") is True
+
+        # Change to new password -> must rebuild archive
+        run_backup(sources, str(dest), "pw_arc", password="pass_two")
+        info2 = json.loads(info_file.read_text(encoding="utf-8"))
+        assert info2.get("has_password") is True
+        assert info2["password_hash"] != info1["password_hash"]
+
+        # Old password should fail
+        out_old = tmp_path / "out_old"
+        with pytest.raises(Exception):
+            _extract_archive(dest / "pw_arc.7z", out_old, password="pass_one")
+
+        # New password should succeed
+        out_new = tmp_path / "out_new"
+        _extract_archive(dest / "pw_arc.7z", out_new, password="pass_two")
+        assert (out_new / "single.txt").read_text(encoding="utf-8") == "file"
+
+    def test_removing_password_triggers_rebuild(self, source_tree: Path, tmp_path: Path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        sources = [str(source_tree / "single.txt")]
+
+        run_backup(sources, str(dest), "pw_arc", password="has_secret")
+        info_file = dest / "pw_arc_hash.json"
+        info1 = json.loads(info_file.read_text(encoding="utf-8"))
+        assert info1.get("has_password") is True
+
+        # Remove password -> must rebuild archive as open
+        run_backup(sources, str(dest), "pw_arc", password=None)
+        info2 = json.loads(info_file.read_text(encoding="utf-8"))
+        assert info2.get("has_password") is False
+        assert "password_hash" not in info2
+
+        # Extract without password succeeds
+        out_open = tmp_path / "out_open"
+        _extract_archive(dest / "pw_arc.7z", out_open, password=None)
+        assert (out_open / "single.txt").read_text(encoding="utf-8") == "file"
+
+
+class TestArchiveValidationAndCleanup:
+    def test_create_archive_initial_failure_cleans_partial_files(self, tmp_path: Path):
+        from unittest.mock import patch
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("hello", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        def fail_write(*args, **kwargs):
+            # Simulate partially written archive file on disk
+            (dest / "fail_arc.7z").write_bytes(b"corrupt partial archive data")
+            raise RuntimeError("disk full during write")
+
+        with patch("backup.py7zr.SevenZipFile.writeall", side_effect=fail_write):
+            with pytest.raises(RuntimeError, match="disk full during write"):
+                create_archive([str(src)], str(dest), "fail_arc", None, None)
+
+        # Dest should be clean of partial files matching the archive pattern
+        assert not (dest / "fail_arc.7z").exists()
+
+    def test_run_backup_validates_archive_name_path_traversal(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("content", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        with pytest.raises(ValueError, match="Invalid archive_name"):
+            run_backup([str(src)], str(dest), "../evil")
+
+        with pytest.raises(ValueError, match="Invalid archive_name"):
+            run_backup([str(src)], str(dest), "CON")
+
+        with pytest.raises(ValueError, match="Invalid archive_name"):
+            run_backup([str(src)], str(dest), "sub/dir")
+
+        with pytest.raises(ValueError, match="Invalid archive_name"):
+            run_backup([str(src)], str(dest), "bad*name")
+
+        with pytest.raises(ValueError, match="Invalid archive_name"):
+            create_archive([str(src)], str(dest), "../evil", None, None)
+
+    def test_compute_content_hash_includes_relative_path(self, tmp_path: Path):
+        f = tmp_path / "data.bin"
+        f.write_bytes(b"same_content")
+
+        h1, err1 = compute_content_hash([(str(f), "dir_a/data.bin", "file")])
+        h2, err2 = compute_content_hash([(str(f), "dir_b/data.bin", "file")])
+
+        assert not err1 and not err2
+        assert h1 is not None and h2 is not None
+        assert h1 != h2
+
+    def test_meta_and_content_errors_do_not_persist_none_hashes(self, tmp_path: Path):
+        from unittest.mock import patch
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        # Metadata error on first run -> should not create hash file with None
+        with patch("backup.compute_metadata_hash", return_value=(None, True)):
+            run_backup([str(src)], str(dest), "arc_err")
+        assert not (dest / "arc_err_hash.json").exists()
+
+        # Content error with check_content_hash -> should not create hash file with None
+        with patch("backup.compute_content_hash", return_value=(None, True)):
+            run_backup([str(src)], str(dest), "arc_content_err", check_content_hash=True)
+        assert not (dest / "arc_content_err_hash.json").exists()
+
+
+

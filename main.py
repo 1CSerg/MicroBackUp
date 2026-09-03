@@ -11,10 +11,29 @@ from pathlib import Path
 from typing import Optional, Any
 
 try:
-    from backup import run_backup
+    from backup import run_backup, _validate_archive_name
 except ImportError as _exc:  # pragma: no cover - depends on runtime environment
     run_backup = None  # type: ignore[assignment]
     _IMPORT_ERROR = _exc
+    _WINDOWS_RESERVED_NAMES = frozenset(
+        {"CON", "PRN", "AUX", "NUL"}
+        | {f"COM{i}" for i in range(1, 10)}
+        | {f"LPT{i}" for i in range(1, 10)}
+    )
+
+    def _validate_archive_name(archive_name: str) -> Optional[str]:  # type: ignore[misc]
+        if not archive_name or archive_name in (".", ".."):
+            return f"Archive name is empty or reserved: {archive_name!r}"
+        if "\\" in archive_name or "/" in archive_name:
+            return f"Archive name must not contain path separators: {archive_name!r}"
+        if re.search(r'[\x00-\x1f<>:"|?*]', archive_name):
+            return f"Archive name contains forbidden characters: {archive_name!r}"
+        if archive_name != archive_name.rstrip(". "):
+            return f"Archive name must not end with dots or spaces: {archive_name!r}"
+        stem = archive_name.split(".", 1)[0].upper()
+        if stem in _WINDOWS_RESERVED_NAMES:
+            return f"Archive name is a reserved device name: {archive_name!r}"
+        return None
 else:
     _IMPORT_ERROR = None
 
@@ -52,15 +71,19 @@ class _CurrentStreamHandler(logging.StreamHandler):
     """StreamHandler that always writes to the live sys.stdout or sys.stderr."""
 
     def __init__(self, stream_name: str) -> None:
-        super().__init__(stream=getattr(sys, stream_name))
         self._stream_name = stream_name
+        super().__init__(stream=getattr(sys, stream_name, None))
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.stream = getattr(sys, self._stream_name)
+        self.stream = getattr(sys, self._stream_name, None)
+        if self.stream is None:
+            return
         super().emit(record)
 
     def flush(self) -> None:
-        self.stream = getattr(sys, self._stream_name)
+        self.stream = getattr(sys, self._stream_name, None)
+        if self.stream is None:
+            return
         super().flush()
 
 
@@ -224,35 +247,6 @@ def _resolve_password(
     return global_password
 
 
-_WINDOWS_RESERVED_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{i}" for i in range(1, 10)}
-    | {f"LPT{i}" for i in range(1, 10)}
-)
-
-
-def _validate_archive_name(archive_name: str) -> Optional[str]:
-    """Return an error message if archive_name is unsafe, else None."""
-    if not archive_name or archive_name in (".", ".."):
-        return f"Archive name is empty or reserved: {archive_name!r}"
-    # Reject path separators and traversal segments.
-    if "\\" in archive_name or "/" in archive_name:
-        return f"Archive name must not contain path separators: {archive_name!r}"
-    # Reject Windows-invalid filename characters and non-printable control characters.
-    if re.search(r'[\x00-\x1f<>:"|?*]', archive_name):
-        return f"Archive name contains forbidden characters: {archive_name!r}"
-    # Windows silently strips trailing dots and spaces; reject them so the
-    # on-disk name matches what the user asked for.
-    if archive_name != archive_name.rstrip(". "):
-        return f"Archive name must not end with dots or spaces: {archive_name!r}"
-    # Reject Windows-reserved device names (case-insensitive, with or without
-    # extension).
-    stem = archive_name.split(".", 1)[0].upper()
-    if stem in _WINDOWS_RESERVED_NAMES:
-        return f"Archive name is a reserved device name: {archive_name!r}"
-    return None
-
-
 def execute_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str], check_content_hash: bool = False) -> bool:
     if run_backup is None:
         logger.error(
@@ -274,6 +268,10 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
         if not os.path.exists(src):
             logger.error(f"Error: Source path does not exist: {src}")
             return False
+
+    if os.path.isfile(dest):
+        logger.error(f"Error: Destination path is an existing file, not a directory: {dest}")
+        return False
 
     if not os.path.exists(dest):
         try:
@@ -300,6 +298,9 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
 
 def parse_optional_size(value: Optional[str], context: str) -> Optional[int]:
     if not value:
+        return None
+    val_clean = value.strip().lower()
+    if val_clean in ("none", "off"):
         return None
     try:
         return parse_size(value)
@@ -361,6 +362,7 @@ def run_from_config(
     log_overrides: Optional[dict[str, Any]] = None,
     cli_check_content_hash: bool = False,
     cli_password: Optional[str] = None,
+    cli_split: Optional[int] = None,
 ) -> bool:
     parser = configparser.ConfigParser(interpolation=None)
     try:
@@ -429,14 +431,19 @@ def run_from_config(
             any_failed = True
             continue
 
-        split_raw = parser.get(section, 'split', fallback=None)
-        if split_raw:
-            try:
-                split_size = parse_optional_size(split_raw, f"[{section}] split")
-            except ConfigError as e:
-                logger.error(f"Error: {e}")
-                any_failed = True
-                continue
+        if cli_split is not None:
+            split_size = cli_split
+        elif parser.has_option(section, 'split'):
+            split_raw = parser.get(section, 'split').strip()
+            if not split_raw or split_raw.lower() in ("none", "off"):
+                split_size = None
+            else:
+                try:
+                    split_size = parse_optional_size(split_raw, f"[{section}] split")
+                except ConfigError as e:
+                    logger.error(f"Error: {e}")
+                    any_failed = True
+                    continue
         else:
             split_size = global_split
 
@@ -561,11 +568,14 @@ def main() -> None:
     args = parser.parse_args()
 
     # Скрываем окно консоли в Windows сразу, чтобы не мелькало
-    if args.hide and os.name == 'nt':
-        import ctypes
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    if args.hide:
+        if os.name == 'nt':
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)
+        else:
+            logger.info("--hide is supported only on Windows; ignored on this platform.")
 
     try:
         log_overrides = _cli_log_overrides(args)
@@ -577,13 +587,12 @@ def main() -> None:
         if not os.path.exists(args.config):
             logger.error(f"Error: Config file does not exist: {args.config}")
             sys.exit(1)
-        if args.hide and os.name != 'nt':
-            logger.info("--hide is supported only on Windows; ignored on this platform.")
         if not run_from_config(
             args.config,
             log_overrides=log_overrides,
             cli_check_content_hash=args.check_content_hash,
             cli_password=args.password,
+            cli_split=args.split,
         ):
             sys.exit(1)
         return
@@ -598,9 +607,6 @@ def main() -> None:
     except ConfigError as e:
         logger.error(f"Error: {e}")
         sys.exit(1)
-
-    if args.hide and os.name != 'nt':
-        logger.info("--hide is supported only on Windows; ignored on this platform.")
 
     if not args.sources or not args.dest or not args.name:
         parser.error("the following arguments are required: -s/--sources, -d/--dest, -n/--name (or use -c/--config)")

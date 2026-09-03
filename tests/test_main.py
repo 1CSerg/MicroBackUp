@@ -198,6 +198,17 @@ class TestExecuteBackup:
         assert ok is False
         assert "Could not create destination directory" in capsys.readouterr().err
 
+    def test_destination_is_file_returns_false(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+        dest_file = tmp_path / "dest_file.txt"
+        dest_file.write_text("already a file", encoding="utf-8")
+
+        ok = execute_backup([str(src)], str(dest_file), "arc", None, None)
+        assert ok is False
+        assert "Destination path is an existing file, not a directory" in capsys.readouterr().err
+
 
 class TestRunFromConfig:
     def _write_conf(self, path: Path, text: str) -> Path:
@@ -495,6 +506,90 @@ check_content_hash = false
         assert ok is True
         # Explicit `false` in section must win over CLI flag.
         assert captured == [False]
+
+    def test_section_split_empty_or_disabled_overrides_global(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = tmp_path / "split_override.conf"
+        conf.write_text(
+            f"""[GLOBAL]
+split = 100m
+
+[JobEmpty]
+sources = {src}
+dest = {dest}
+name = arc_empty
+split =
+
+[JobNone]
+sources = {src}
+dest = {dest}
+name = arc_none
+split = none
+
+[JobOff]
+sources = {src}
+dest = {dest}
+name = arc_off
+split = off
+""",
+            encoding="utf-8",
+        )
+        splits = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            splits.append((archive_name, split_size))
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+
+        assert ok is True
+        assert splits == [
+            ("arc_empty", None),
+            ("arc_none", None),
+            ("arc_off", None),
+        ]
+
+    def test_cli_split_overrides_all_sections(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = tmp_path / "cli_split.conf"
+        conf.write_text(
+            f"""[GLOBAL]
+split = 100m
+
+[Job1]
+sources = {src}
+dest = {dest}
+name = arc1
+split = 50m
+
+[Job2]
+sources = {src}
+dest = {dest}
+name = arc2
+""",
+            encoding="utf-8",
+        )
+        splits = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            splits.append((archive_name, split_size))
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf), cli_split=10 * 1024 * 1024)
+
+        assert ok is True
+        assert splits == [
+            ("arc1", 10 * 1024 * 1024),
+            ("arc2", 10 * 1024 * 1024),
+        ]
 
 
 class TestResolvePassword:
@@ -873,6 +968,47 @@ class TestMainCli:
         assert exc.value.code == 1
         assert "Failed to open log" in capsys.readouterr().err
 
+    def test_cli_split_with_config_mode_passes_cli_split(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = tmp_path / "split.conf"
+        conf.write_text(
+            f"[GLOBAL]\nsplit = 50m\n\n[Job]\nsources = {src}\ndest = {dest}\nname = arc\n",
+            encoding="utf-8",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(split_size)
+            return True
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["main.py", "-c", str(conf), "--split", "2m"],
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            main()
+        assert captured == [2 * 1024 * 1024]
+
+    def test_hide_flag_non_windows_logged_once(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["main.py", "-s", str(src), "-d", str(dest), "-n", "arc", "--hide"],
+        )
+        with patch("main.execute_backup", return_value=True):
+            main()
+        out = capsys.readouterr().out
+        assert out.count("--hide is supported only on Windows") == 1
+
 
 class TestLogHelpers:
     def test_parse_log_level_default(self):
@@ -1026,3 +1162,44 @@ name = logged
         with patch.object(sys.stdout, "flush") as mock_flush:
             handler.flush()
             mock_flush.assert_called_once()
+
+    def test_current_stream_handler_when_streams_are_none(self, tmp_path, monkeypatch):
+        """Emulate pythonw / PyInstaller --noconsole environment where stdout/stderr are None."""
+        from main import _CurrentStreamHandler
+        monkeypatch.setattr(sys, "stdout", None)
+        monkeypatch.setattr(sys, "stderr", None)
+
+        stdout_handler = _CurrentStreamHandler("stdout")
+        stderr_handler = _CurrentStreamHandler("stderr")
+
+        assert stdout_handler.stream is None
+        assert stderr_handler.stream is None
+
+        record = logging.LogRecord(
+            name="microbackup",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="test noconsole",
+            args=(),
+            exc_info=None,
+        )
+
+        # emit and flush should complete cleanly without throwing AttributeError
+        stdout_handler.emit(record)
+        stdout_handler.flush()
+        stderr_handler.emit(record)
+        stderr_handler.flush()
+
+        # setup_logging with file logging works even when console streams are None
+        log_file = tmp_path / "bg.log"
+        test_logger = setup_logging(log_file=str(log_file), log_level=logging.INFO)
+        test_logger.info("bg info message")
+        test_logger.warning("bg warning message")
+        test_logger.error("bg error message")
+
+        assert log_file.is_file()
+        content = log_file.read_text(encoding="utf-8")
+        assert "bg info message" in content
+        assert "bg warning message" in content
+        assert "bg error message" in content
