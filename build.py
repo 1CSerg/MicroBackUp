@@ -2,34 +2,45 @@ import os
 import subprocess
 import sys
 
-def build():
-    print("Starting build process with PyInstaller...")
+def run_build(name, noconsole=False):
+    print(f"\n[{name}] Starting build {'(without console)' if noconsole else '(with console)'}...")
     
-    # Check if pyinstaller is installed
+    command = [
+        sys.executable, "-m", "PyInstaller",
+        "--onefile",
+        "--name", name
+    ]
+    
+    if noconsole:
+        command.append("--noconsole")
+        
+    command.append("main.py")
+    
+    result = subprocess.run(command)
+    
+    if result.returncode != 0:
+        print(f"\n[{name}] Build failed.")
+        sys.exit(result.returncode)
+    else:
+        print(f"[{name}] Build successful.")
+
+def build():
+    print("Checking dependencies...")
+    
     try:
         import PyInstaller
     except ImportError:
         print("PyInstaller is not installed. Please install it using: pip install pyinstaller")
         sys.exit(1)
 
-    # Command to run PyInstaller
-    command = [
-        sys.executable, "-m", "PyInstaller",
-        "--onefile",
-        "--name", "MicroBackUp",
-        "main.py"
-    ]
-
-    print(f"Running command: {' '.join(command)}")
+    # 1. Сборка консольной версии
+    run_build("MicroBackUp", noconsole=False)
     
-    result = subprocess.run(command)
+    # 2. Сборка фоновой версии (без консоли)
+    run_build("MicroBackUp-bg", noconsole=True)
     
-    if result.returncode == 0:
-        print("\nBuild successful!")
-        print("Executable can be found in the 'dist' folder.")
-    else:
-        print("\nBuild failed.")
-        sys.exit(result.returncode)
+    print("\nAll builds completed successfully!")
+    print("Executables (MicroBackUp.exe and MicroBackUp-bg.exe) can be found in the 'dist' folder.")
 
 if __name__ == "__main__":
     build()

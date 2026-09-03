@@ -2,9 +2,12 @@ import os
 import hashlib
 import json
 import datetime
+import logging
 import py7zr
 import multivolumefile
 from pathlib import Path
+
+logger = logging.getLogger("microbackup")
 
 def get_all_paths(sources):
     """
@@ -56,7 +59,7 @@ def compute_file_hash(filepath):
             for chunk in iter(lambda: f.read(4096 * 1024), b""):
                 hasher.update(chunk)
     except Exception as e:
-        print(f"Warning: Could not read file {filepath} for hashing: {e}")
+        logger.warning(f"Warning: Could not read file {filepath} for hashing: {e}")
     return hasher.hexdigest()
 
 def compute_content_hash(paths):
@@ -72,7 +75,7 @@ def compute_content_hash(paths):
 def create_archive(sources, dest, archive_name, split_size, password):
     archive_path = Path(dest) / f"{archive_name}.7z"
     
-    print(f"Creating archive: {archive_path}")
+    logger.info(f"Creating archive: {archive_path}")
     
     filters = None
     if password:
@@ -80,7 +83,7 @@ def create_archive(sources, dest, archive_name, split_size, password):
         pass
 
     if split_size:
-        print(f"Splitting archive into volumes of size {split_size} bytes")
+        logger.info(f"Splitting archive into volumes of size {split_size} bytes")
         with multivolumefile.open(archive_path, mode='wb', volume=split_size) as target_archive:
             with py7zr.SevenZipFile(target_archive, 'w', password=password) as archive:
                 for src in sources:
@@ -100,16 +103,16 @@ def create_archive(sources, dest, archive_name, split_size, password):
                 else:
                     archive.writeall(src_path, arcname)
                     
-    print("Archive created successfully.")
+    logger.info("Archive created successfully.")
 
 def run_backup(sources, dest, archive_name, split_size=None, password=None):
     info_file = Path(dest) / f"{archive_name}_hash.json"
     
-    print("Gathering file list...")
+    logger.info("Gathering file list...")
     all_paths = get_all_paths(sources)
     files_count, dirs_count = count_items(all_paths)
     
-    print(f"Found {files_count} files and {dirs_count} directories.")
+    logger.info(f"Found {files_count} files and {dirs_count} directories.")
     
     need_backup = True
     names_hash = None
@@ -120,39 +123,39 @@ def run_backup(sources, dest, archive_name, split_size=None, password=None):
             with open(info_file, 'r', encoding='utf-8') as f:
                 old_info = json.load(f)
                 
-            print("Checking state against previous backup...")
+            logger.info("Checking state against previous backup...")
             
             # Step 1: Check counts
             if old_info.get('files_count') == files_count and old_info.get('dirs_count') == dirs_count:
-                print("Counts match. Checking names hash...")
+                logger.info("Counts match. Checking names hash...")
                 # Step 2: Check names hash
                 names_hash = compute_names_hash(all_paths)
                 if old_info.get('names_hash') == names_hash:
-                    print("Names hash matches. Checking content hash...")
+                    logger.info("Names hash matches. Checking content hash...")
                     # Step 3: Check content hash
                     content_hash = compute_content_hash(all_paths)
                     if old_info.get('content_hash') == content_hash:
-                        print("Content hash matches. No backup needed.")
+                        logger.info("Content hash matches. No backup needed.")
                         need_backup = False
                     else:
-                        print("Content hash differs.")
+                        logger.info("Content hash differs.")
                 else:
-                    print("Names hash differs.")
+                    logger.info("Names hash differs.")
             else:
-                print("Counts differ.")
+                logger.info("Counts differ.")
                 
         except Exception as e:
-            print(f"Error reading info file {info_file}: {e}. Will perform full backup.")
+            logger.error(f"Error reading info file {info_file}: {e}. Will perform full backup.")
     else:
-        print("No previous backup info found. Will perform full backup.")
+        logger.info("No previous backup info found. Will perform full backup.")
 
     if need_backup:
         # Compute hashes if not already computed during checks
         if names_hash is None:
-            print("Computing names hash...")
+            logger.info("Computing names hash...")
             names_hash = compute_names_hash(all_paths)
         if content_hash is None:
-            print("Computing content hash...")
+            logger.info("Computing content hash...")
             content_hash = compute_content_hash(all_paths)
             
         create_archive(sources, dest, archive_name, split_size, password)
@@ -170,11 +173,11 @@ def run_backup(sources, dest, archive_name, split_size=None, password=None):
         
         with open(info_file, 'w', encoding='utf-8') as f:
             json.dump(new_info, f, indent=4)
-        print(f"Updated info file: {info_file}")
+        logger.info(f"Updated info file: {info_file}")
         
     else:
         # Just update the check date
         old_info['last_check_date'] = datetime.datetime.now().isoformat()
         with open(info_file, 'w', encoding='utf-8') as f:
             json.dump(old_info, f, indent=4)
-        print(f"Updated check date in info file: {info_file}")
+        logger.info(f"Updated check date in info file: {info_file}")

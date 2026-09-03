@@ -19,6 +19,11 @@ dist/
 .idea/
 *.swp
 
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
 # OS generated files
 .DS_Store
 Thumbs.db
