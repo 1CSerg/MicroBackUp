@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -r requirements-build.txt
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Build executables
+        run: python build.py
+
+      - name: Pack Python distribution
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $dir = "MicroBackUp-$tag-python"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item -Path @(
+            "main.py",
+            "backup.py",
+            "README.md",
+            "MicroBackUp.conf",
+            "requirements.txt"
+          ) -Destination $dir
+          if (-not (Test-Path dist)) {
+            New-Item -ItemType Directory -Path dist | Out-Null
+          }
+          Compress-Archive -Path $dir -DestinationPath "dist/$dir.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/MicroBackUp.exe
+            dist/MicroBackUp-bg.exe
+            dist/MicroBackUp-*-python.zip

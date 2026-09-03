@@ -24,14 +24,21 @@ def run_build(name, noconsole=False):
     else:
         print(f"[{name}] Build successful.")
 
-def build():
+def ensure_dependencies():
     print("Checking dependencies...")
-    
     try:
-        import PyInstaller
+        import PyInstaller  # noqa: F401
     except ImportError:
-        print("PyInstaller is not installed. Please install it using: pip install pyinstaller")
-        sys.exit(1)
+        req_build = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements-build.txt")
+        print("PyInstaller is not installed. Installing build dependencies from requirements-build.txt...")
+        result = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_build])
+        if result.returncode != 0:
+            print("Failed to install dependencies.")
+            sys.exit(result.returncode)
+
+
+def build():
+    ensure_dependencies()
 
     # 1. Сборка консольной версии
     run_build("MicroBackUp", noconsole=False)
