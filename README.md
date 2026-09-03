@@ -91,7 +91,7 @@ python main.py -s docs -d D:\backups -n my_backup --split 500m -p secret
 ```bash
 python main.py -c MicroBackUp.conf
 ```
-(используйте `MicroBackUp.conf.example` как шаблон — скопируйте его в `MicroBackUp.conf` и отредактируйте)
+(сначала скопируйте шаблон: `copy MicroBackUp.conf.example MicroBackUp.conf` на Windows или `cp MicroBackUp.conf.example MicroBackUp.conf` на Linux, затем отредактируйте под себя)
 
 ## Конфигурационный файл
 

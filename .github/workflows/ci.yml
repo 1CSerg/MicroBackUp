@@ -36,7 +36,10 @@ jobs:
         run: ruff check .
 
       - name: Audit dependencies for known vulnerabilities
-        run: pip-audit -r requirements.txt
+        run: |
+          pip-audit -r requirements.txt
+          pip-audit -r requirements-dev.txt
+          pip-audit -r requirements-build.txt
 
       - name: Run tests with coverage
         run: python -m pytest --cov=main --cov=backup --cov-report=term-missing

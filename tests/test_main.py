@@ -44,6 +44,12 @@ class TestParseSize:
         assert parse_size("1g") == 1024 * 1024 * 1024
         assert parse_size("1.5g") == int(1.5 * 1024 * 1024 * 1024)
 
+    def test_two_letter_suffixes(self):
+        assert parse_size("100kb") == 100 * 1024
+        assert parse_size("2mb") == 2 * 1024 * 1024
+        assert parse_size("1gb") == 1024 * 1024 * 1024
+        assert parse_size("1.5KB") == int(1.5 * 1024)
+
     def test_plain_bytes(self):
         assert parse_size("1024") == 1024
 
@@ -85,6 +91,40 @@ class TestParseOptionalSize:
     def test_invalid_size_raises_config_error(self):
         with pytest.raises(ConfigError, match=r"\[GLOBAL\] split: Invalid size format"):
             parse_optional_size("nope", "[GLOBAL] split")
+
+
+class TestValidateArchiveName:
+    def test_valid_name_passes(self):
+        from main import _validate_archive_name
+        assert _validate_archive_name("my_backup") is None
+        assert _validate_archive_name("my-backup.2026") is None
+
+    def test_path_separators_rejected(self):
+        from main import _validate_archive_name
+        assert _validate_archive_name("a/b") is not None
+        assert _validate_archive_name("a\\b") is not None
+
+    def test_forbidden_chars_rejected(self):
+        from main import _validate_archive_name
+        for name in ("a:b", "a*b", "a?b", "a|b", 'a"b', "a<b", "a>b"):
+            assert _validate_archive_name(name) is not None
+
+    def test_trailing_dots_and_spaces_rejected(self):
+        from main import _validate_archive_name
+        assert _validate_archive_name("name.") is not None
+        assert _validate_archive_name("name ") is not None
+        assert _validate_archive_name("name..") is not None
+
+    def test_reserved_device_names_rejected(self):
+        from main import _validate_archive_name
+        for name in ("CON", "con", "PRN", "AUX", "NUL", "COM1", "LPT9", "con.txt"):
+            assert _validate_archive_name(name) is not None
+
+    def test_empty_and_dotdot_rejected(self):
+        from main import _validate_archive_name
+        assert _validate_archive_name("") is not None
+        assert _validate_archive_name(".") is not None
+        assert _validate_archive_name("..") is not None
 
 
 class TestExecuteBackup:
@@ -166,6 +206,15 @@ class TestRunFromConfig:
         ok = run_from_config(str(conf))
         assert ok is False
         assert "[GLOBAL] split" in capsys.readouterr().err
+
+    def test_duplicate_global_section_returns_false(self, tmp_path, capsys):
+        conf = self._write_conf(
+            tmp_path / "dup_global.conf",
+            "[GLOBAL]\nsplit = 10m\n\n[global]\nsplit = 20m\n\n[Job]\nsources = a\ndest = b\nname = n\n",
+        )
+        ok = run_from_config(str(conf))
+        assert ok is False
+        assert "Duplicate [GLOBAL] section" in capsys.readouterr().err
 
     def test_skips_section_with_missing_fields(self, tmp_path, capsys):
         conf = self._write_conf(

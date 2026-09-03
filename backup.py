@@ -20,30 +20,43 @@ CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB chunk size for hashing
 def get_all_paths(sources: list[str]) -> list[tuple[str, str, str]]:
     """
     Returns a list of all files and directories in the given sources.
-    Each item is a tuple (absolute_path, relative_path_for_archive).
+    Each item is a tuple (absolute_path, relative_path, kind) where kind is
+    'file' or 'dir'. relative_path is guaranteed unique across all sources so
+    that hashes distinguish items from different sources even when basenames
+    collide (e.g. two file sources named "file.txt" in different directories).
     """
     all_paths = []
-    
+    seen_rel: set[str] = set()
+
+    def _add(abs_path: Path, rel_path: str, kind: str) -> None:
+        unique_rel = rel_path
+        counter = 1
+        while unique_rel in seen_rel:
+            counter += 1
+            unique_rel = f"{rel_path}_{counter}"
+        seen_rel.add(unique_rel)
+        all_paths.append((str(abs_path), unique_rel, kind))
+
     for src in sources:
         src_path = Path(src).resolve()
         parent_dir = src_path.parent
 
         if src_path.is_file():
             rel_path = src_path.relative_to(parent_dir)
-            all_paths.append((str(src_path), str(rel_path), 'file'))
+            _add(src_path, str(rel_path), 'file')
         elif src_path.is_dir():
             rel_path = src_path.relative_to(parent_dir)
-            all_paths.append((str(src_path), str(rel_path), 'dir'))
+            _add(src_path, str(rel_path), 'dir')
 
             for root, dirs, files in os.walk(src_path):
                 for d in dirs:
                     d_path = Path(root) / d
                     d_rel = d_path.relative_to(parent_dir)
-                    all_paths.append((str(d_path), str(d_rel), 'dir'))
+                    _add(d_path, str(d_rel), 'dir')
                 for f in files:
                     f_path = Path(root) / f
                     f_rel = f_path.relative_to(parent_dir)
-                    all_paths.append((str(f_path), str(f_rel), 'file'))
+                    _add(f_path, str(f_rel), 'file')
         else:
             logger.warning(f"Source path does not exist, skipping: {src}")
 
@@ -74,7 +87,7 @@ def compute_file_hash(filepath: str) -> str:
         return f"ERROR:{filepath}"
     return hasher.hexdigest()
 
-def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[str, bool]:
+def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[str], bool]:
     # Sort relative paths to ensure consistent hashing order
     file_paths = sorted([p for p in paths if p[2] == 'file'], key=lambda x: x[1])
 
@@ -85,9 +98,14 @@ def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[str, bool]:
         if f_hash.startswith("ERROR:"):
             had_error = True
         hasher.update(f_hash.encode('utf-8'))
-    return hasher.hexdigest(), had_error
+    # On any read error the digest is not trustworthy as a content fingerprint:
+    # return None so run_backup forces a full backup and doesn't persist a
+    # hash that mixes error markers with real data.
+    if had_error:
+        return None, True
+    return hasher.hexdigest(), False
 
-def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[str, bool]:
+def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[Optional[str], bool]:
     # Sort relative paths to ensure consistent hashing order
     file_paths = sorted([p for p in paths if p[2] == 'file'], key=lambda x: x[1])
 
@@ -102,9 +120,10 @@ def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[str, bool]
             hasher.update(meta_str.encode('utf-8'))
         except OSError as e:
             logger.error(f"Error: Could not read metadata for {abs_path}: {e}")
-            hasher.update(f"ERROR:{abs_path}".encode('utf-8'))
             had_error = True
-    return hasher.hexdigest(), had_error
+    if had_error:
+        return None, True
+    return hasher.hexdigest(), False
 
 def create_archive(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str]) -> None:
     dest_path = Path(dest)
@@ -127,7 +146,7 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
                 else:
                     arcname = f"{original_arcname}_{counter}"
                 counter += 1
-            logger.info(f"Renamed '{original_arcname}' to '{arcname}' in the archive to prevent collision.")
+            logger.warning(f"Renamed '{original_arcname}' to '{arcname}' in the archive to prevent collision.")
         
         seen_arcnames.add(arcname)
         
@@ -166,6 +185,8 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
                 shutil.rmtree(temp_dir)
             except OSError as e:
                 logger.warning(f"Could not remove temporary directory {temp_dir}: {e}")
+                # Best-effort fallback so leftover temp dirs don't pollute dest.
+                shutil.rmtree(temp_dir, ignore_errors=True)
             
         logger.info("Archive created successfully.")
     except Exception:

@@ -7,6 +7,7 @@ import py7zr
 import pytest
 
 from backup import (
+    compute_content_hash,
     compute_metadata_hash,
     compute_file_hash,
     compute_names_hash,
@@ -66,6 +67,36 @@ class TestGetAllPathsAndCount:
         get_all_paths([str(tmp_path / "does_not_exist")])
         assert "does not exist" in capsys.readouterr().err
 
+    def test_distinct_rel_paths_for_same_basename_file_sources(self, tmp_path: Path):
+        dir_a = tmp_path / "A"
+        dir_b = tmp_path / "B"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        file_a = dir_a / "file.txt"
+        file_b = dir_b / "file.txt"
+        file_a.write_text("a", encoding="utf-8")
+        file_b.write_text("b", encoding="utf-8")
+
+        paths = get_all_paths([str(file_a), str(file_b)])
+        rels = [rel for _abs, rel, kind in paths if kind == "file"]
+        # rel_path must be unique per source so hashes don't collapse them.
+        assert len(rels) == 2
+        assert len(set(rels)) == 2
+
+    def test_names_hash_distinguishes_same_basename_sources_together(self, tmp_path: Path):
+        dir_a = tmp_path / "A"
+        dir_b = tmp_path / "B"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "file.txt").write_text("a", encoding="utf-8")
+        (dir_b / "file.txt").write_text("b", encoding="utf-8")
+
+        # Both sources passed together: rel_paths are disambiguated, so
+        # adding the second same-named source must change names_hash.
+        h_one = compute_names_hash(get_all_paths([str(dir_a / "file.txt")]))
+        h_both = compute_names_hash(get_all_paths([str(dir_a / "file.txt"), str(dir_b / "file.txt")]))
+        assert h_one != h_both
+
 
 class TestHashing:
     def test_names_hash_stable_and_order_independent(self, source_tree: Path):
@@ -119,6 +150,23 @@ class TestHashing:
         assert len(h1) == 64
         assert err1 is False
         assert err2 is False
+
+    def test_metadata_hash_returns_none_on_stat_error(self, tmp_path: Path):
+        from unittest.mock import patch
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("data", encoding="utf-8")
+        paths = get_all_paths([str(src)])
+        with patch("backup.os.stat", side_effect=OSError("denied")):
+            digest, had_error = compute_metadata_hash(paths)
+        assert digest is None
+        assert had_error is True
+
+    def test_content_hash_returns_none_on_read_error(self, tmp_path: Path):
+        paths = [(str(tmp_path / "missing.txt"), "missing.txt", "file")]
+        digest, had_error = compute_content_hash(paths)
+        assert digest is None
+        assert had_error is True
 
 
 class TestBackupIntegration:

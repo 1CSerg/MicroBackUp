@@ -45,12 +45,9 @@ jobs:
             "main.py",
             "backup.py",
             "README.md",
-            "MicroBackUp.conf",
+            "MicroBackUp.conf.example",
             "requirements.txt"
           ) -Destination $dir
-          if (-not (Test-Path dist)) {
-            New-Item -ItemType Directory -Path dist | Out-Null
-          }
           Compress-Archive -Path $dir -DestinationPath "dist/$dir.zip" -Force
 
       - name: Publish GitHub Release

@@ -118,10 +118,15 @@ def parse_size(size_str: Optional[str]) -> Optional[int]:
     suffixes = {'k': 1024, 'm': 1024 * 1024, 'g': 1024 * 1024 * 1024}
     multiplier = 1
     number_part = size_str
-    last = size_str[-1]
-    if last in suffixes:
-        multiplier = suffixes[last]
-        number_part = size_str[:-1]
+    # Accept both single-letter (k, m, g) and two-letter (kb, mb, gb) suffixes.
+    if len(size_str) >= 2 and size_str[-2:] in ('kb', 'mb', 'gb'):
+        multiplier = suffixes[size_str[-2]]
+        number_part = size_str[:-2]
+    else:
+        last = size_str[-1]
+        if last in suffixes:
+            multiplier = suffixes[last]
+            number_part = size_str[:-1]
 
     try:
         numeric = float(number_part)
@@ -175,6 +180,13 @@ def parse_log_backup_count(value: Any, context: str) -> int:
         raise ConfigError(f"{context}: invalid log_backup_count '{value}'. Use a non-negative integer.")
 
 
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
 def _validate_archive_name(archive_name: str) -> Optional[str]:
     """Return an error message if archive_name is unsafe, else None."""
     if not archive_name or archive_name in (".", ".."):
@@ -185,6 +197,15 @@ def _validate_archive_name(archive_name: str) -> Optional[str]:
     # Reject Windows-invalid filename characters.
     if re.search(r'[<>:"|?*]', archive_name):
         return f"Archive name contains forbidden characters: {archive_name!r}"
+    # Windows silently strips trailing dots and spaces; reject them so the
+    # on-disk name matches what the user asked for.
+    if archive_name != archive_name.rstrip(". "):
+        return f"Archive name must not end with dots or spaces: {archive_name!r}"
+    # Reject Windows-reserved device names (case-insensitive, with or without
+    # extension).
+    stem = archive_name.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        return f"Archive name is a reserved device name: {archive_name!r}"
     return None
 
 
@@ -308,6 +329,11 @@ def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = 
     try:
         for section in parser.sections():
             if section.upper() == GLOBAL_SECTION:
+                if global_section_name is not None:
+                    raise ConfigError(
+                        f"Duplicate [GLOBAL] section: both [{global_section_name}] and "
+                        f"[{section}] normalize to GLOBAL; keep exactly one."
+                    )
                 global_section_name = section
                 split_raw = parser.get(section, 'split', fallback=None)
                 global_split = parse_optional_size(split_raw, f"[{section}] split")

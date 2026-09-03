@@ -26,6 +26,7 @@ def run_build(name, noconsole=False):
     command = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
+        "--clean",
         "--name", name
     ]
     
