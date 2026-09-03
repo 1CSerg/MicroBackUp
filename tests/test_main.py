@@ -344,6 +344,15 @@ class TestMainCli:
         with pytest.raises(SystemExit):
             main()
 
+    def test_version_flag_prints_version_and_exits(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["main.py", "-v"])
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "MicroBackUp" in out
+        assert "1.0.0" in out
+
     def test_missing_config_file(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv", ["main.py", "-c", str(tmp_path / "no.conf")])
         with pytest.raises(SystemExit) as exc:

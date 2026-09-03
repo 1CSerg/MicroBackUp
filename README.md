@@ -114,7 +114,7 @@ python main.py -c MicroBackUp.conf
 ```ini
 [GLOBAL]
 split = 100m
-password = my_global_secret
+password = <your_password>
 log_file = MicroBackUp.log
 log_level = INFO
 log_max_size = 5m
@@ -130,5 +130,5 @@ sources = D:\Work\ProjectB
 dest = D:\Backups\ProjectB
 name = proj_b_backup
 split = 500m
-password = specific_secret
+password = <your_password>
 ```

@@ -72,21 +72,25 @@ def compute_file_hash(filepath: str) -> str:
         return f"ERROR:{filepath}"
     return hasher.hexdigest()
 
-def compute_content_hash(paths: list[tuple[str, str, str]]) -> str:
+def compute_content_hash(paths: list[tuple[str, str, str]]) -> tuple[str, bool]:
     # Sort relative paths to ensure consistent hashing order
     file_paths = sorted([p for p in paths if p[2] == 'file'], key=lambda x: x[1])
-    
+
     hasher = hashlib.sha256()
+    had_error = False
     for abs_path, rel_path, _ in file_paths:
         f_hash = compute_file_hash(abs_path)
+        if f_hash.startswith("ERROR:"):
+            had_error = True
         hasher.update(f_hash.encode('utf-8'))
-    return hasher.hexdigest()
+    return hasher.hexdigest(), had_error
 
-def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> str:
+def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> tuple[str, bool]:
     # Sort relative paths to ensure consistent hashing order
     file_paths = sorted([p for p in paths if p[2] == 'file'], key=lambda x: x[1])
-    
+
     hasher = hashlib.sha256()
+    had_error = False
     for abs_path, rel_path, _ in file_paths:
         try:
             stat = os.stat(abs_path)
@@ -97,7 +101,8 @@ def compute_metadata_hash(paths: list[tuple[str, str, str]]) -> str:
         except OSError as e:
             logger.error(f"Error: Could not read metadata for {abs_path}: {e}")
             hasher.update(f"ERROR:{abs_path}".encode('utf-8'))
-    return hasher.hexdigest()
+            had_error = True
+    return hasher.hexdigest(), had_error
 
 def create_archive(sources: list[str], dest: str, archive_name: str, split_size: Optional[int], password: Optional[str]) -> None:
     dest_path = Path(dest)
@@ -112,9 +117,13 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
         if arcname in seen_arcnames:
             logger.error(f"Duplicate archive name detected: '{arcname}' for path '{src_path}'.")
             original_arcname = arcname
+            stem, dot, suffix = original_arcname.partition(".")
             counter = 1
             while arcname in seen_arcnames:
-                arcname = f"{original_arcname}_{counter}"
+                if dot:
+                    arcname = f"{stem}_{counter}.{suffix}"
+                else:
+                    arcname = f"{original_arcname}_{counter}"
                 counter += 1
             logger.info(f"Renamed '{original_arcname}' to '{arcname}' in the archive to prevent collision.")
         
@@ -151,7 +160,10 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
                         
         if temp_dir:
             logger.info("Removing old archive files")
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(temp_dir)
+            except OSError as e:
+                logger.warning(f"Could not remove temporary directory {temp_dir}: {e}")
             
         logger.info("Archive created successfully.")
     except Exception:
@@ -172,6 +184,14 @@ def create_archive(sources: list[str], dest: str, archive_name: str, split_size:
             except OSError:
                 pass
         raise
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON to path atomically via a temp file + os.replace."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp_path, path)
+
 
 def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Optional[int] = None, password: Optional[str] = None, check_content_hash: bool = False) -> None:
     info_file = Path(dest) / f"{archive_name}_hash.json"
@@ -200,39 +220,53 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Opt
             try:
                 with open(info_file, 'r', encoding='utf-8') as f:
                     old_info = json.load(f)
-                    
+
                 logger.info("Checking state against previous backup...")
-                
-                # Step 1: Check counts
-                if old_info.get('files_count') == files_count and old_info.get('dirs_count') == dirs_count:
-                    logger.info("Counts match. Checking names hash...")
-                    # Step 2: Check names hash
-                    names_hash = compute_names_hash(all_paths)
-                    if old_info.get('names_hash') == names_hash:
-                        logger.info("Names hash matches. Checking metadata hash...")
-                        # Step 3: Check metadata hash
-                        metadata_hash = compute_metadata_hash(all_paths)
-                        if old_info.get('metadata_hash') == metadata_hash:
-                            logger.info("Metadata hash matches.")
-                            # Step 4: Check content hash if requested
-                            if check_content_hash:
-                                logger.info("Checking content hash...")
-                                content_hash = compute_content_hash(all_paths)
-                                if old_info.get('content_hash') == content_hash:
-                                    logger.info("Content hash matches. No backup needed.")
-                                    need_backup = False
-                                else:
-                                    logger.info("Content hash differs.")
-                            else:
-                                logger.info("Content hash check skipped. No backup needed.")
-                                need_backup = False
-                        else:
-                            logger.info("Metadata hash differs.")
-                    else:
-                        logger.info("Names hash differs.")
+
+                # Check split format change first: if the requested split_size
+                # differs from the previous run, the archive layout changes and
+                # we must rebuild regardless of content hashes.
+                old_split = old_info.get('split_size')
+                if old_split != split_size:
+                    logger.info(
+                        f"Split size changed (was {old_split}, now {split_size}). "
+                        f"Will perform full backup."
+                    )
                 else:
-                    logger.info("Counts differ.")
-                    
+                    # Step 1: Check counts
+                    if old_info.get('files_count') == files_count and old_info.get('dirs_count') == dirs_count:
+                        logger.info("Counts match. Checking names hash...")
+                        # Step 2: Check names hash
+                        names_hash = compute_names_hash(all_paths)
+                        if old_info.get('names_hash') == names_hash:
+                            logger.info("Names hash matches. Checking metadata hash...")
+                            # Step 3: Check metadata hash
+                            metadata_hash, meta_error = compute_metadata_hash(all_paths)
+                            if meta_error:
+                                logger.info("Metadata read error detected. Will perform full backup.")
+                            elif old_info.get('metadata_hash') == metadata_hash:
+                                logger.info("Metadata hash matches.")
+                                # Step 4: Check content hash if requested
+                                if check_content_hash:
+                                    logger.info("Checking content hash...")
+                                    content_hash, content_error = compute_content_hash(all_paths)
+                                    if content_error:
+                                        logger.info("Content read error detected. Will perform full backup.")
+                                    elif old_info.get('content_hash') == content_hash:
+                                        logger.info("Content hash matches. No backup needed.")
+                                        need_backup = False
+                                    else:
+                                        logger.info("Content hash differs.")
+                                else:
+                                    logger.info("Content hash check skipped. No backup needed.")
+                                    need_backup = False
+                            else:
+                                logger.info("Metadata hash differs.")
+                        else:
+                            logger.info("Names hash differs.")
+                    else:
+                        logger.info("Counts differ.")
+
             except (OSError, ValueError) as e:
                 logger.error(f"Error reading info file {info_file}: {e}. Will perform full backup.")
     else:
@@ -245,33 +279,32 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: Opt
             names_hash = compute_names_hash(all_paths)
         if metadata_hash is None:
             logger.info("Computing metadata hash...")
-            metadata_hash = compute_metadata_hash(all_paths)
+            metadata_hash, _ = compute_metadata_hash(all_paths)
         if check_content_hash and content_hash is None:
             logger.info("Computing content hash...")
-            content_hash = compute_content_hash(all_paths)
-            
+            content_hash, _ = compute_content_hash(all_paths)
+
         create_archive(sources, dest, archive_name, split_size, password)
-        
-        now_str = datetime.datetime.now().isoformat()
-        
+
+        now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
         new_info = {
             'files_count': files_count,
             'dirs_count': dirs_count,
             'names_hash': names_hash,
             'metadata_hash': metadata_hash,
+            'split_size': split_size,
             'last_check_date': now_str,
             'last_update_date': now_str
         }
         if check_content_hash:
             new_info['content_hash'] = content_hash
-        
-        with open(info_file, 'w', encoding='utf-8') as f:
-            json.dump(new_info, f, indent=4)
+
+        _atomic_write_json(info_file, new_info)
         logger.info(f"Updated info file: {info_file}")
-        
+
     else:
         # Just update the check date
-        old_info['last_check_date'] = datetime.datetime.now().isoformat()
-        with open(info_file, 'w', encoding='utf-8') as f:
-            json.dump(old_info, f, indent=4)
+        old_info['last_check_date'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _atomic_write_json(info_file, old_info)
         logger.info(f"Updated check date in info file: {info_file}")

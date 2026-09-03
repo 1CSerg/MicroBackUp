@@ -108,11 +108,13 @@ class TestHashing:
         folder.mkdir()
         target = folder / "a.txt"
         target.write_text("v1", encoding="utf-8")
-        h1 = compute_metadata_hash(get_all_paths([str(folder)]))
+        h1, err1 = compute_metadata_hash(get_all_paths([str(folder)]))
         target.write_text("v2", encoding="utf-8")
-        h2 = compute_metadata_hash(get_all_paths([str(folder)]))
+        h2, err2 = compute_metadata_hash(get_all_paths([str(folder)]))
         assert h1 != h2
         assert len(h1) == 64
+        assert err1 is False
+        assert err2 is False
 
 
 class TestBackupIntegration:
@@ -378,9 +380,32 @@ class TestBackupIntegration:
         out = captured.out
         err = captured.err
         assert "Duplicate archive name detected" in err or "Duplicate archive name detected" in out
-        assert "Renamed 'file.txt' to 'file.txt_1'" in out or "Renamed 'file.txt' to 'file.txt_1'" in err
-        
+        assert "Renamed 'file.txt' to 'file_1.txt'" in out or "Renamed 'file.txt' to 'file_1.txt'" in err
+
         extracted = tmp_path / "out"
         _extract_archive(dest / "dup.7z", extracted)
         assert (extracted / "file.txt").read_text(encoding="utf-8") == "one"
-        assert (extracted / "file.txt_1").read_text(encoding="utf-8") == "two"
+        assert (extracted / "file_1.txt").read_text(encoding="utf-8") == "two"
+
+    def test_rebuilds_when_split_format_changes(self, tmp_path: Path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("stable", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        # First run: non-split archive.
+        run_backup([str(src)], str(dest), "fmt")
+        assert (dest / "fmt.7z").is_file()
+        info1 = json.loads((dest / "fmt_hash.json").read_text(encoding="utf-8"))
+        assert info1["split_size"] is None
+
+        # Second run: switch to split. Content unchanged, but split_size
+        # differs, so a rebuild must happen despite matching hashes.
+        run_backup([str(src)], str(dest), "fmt", split_size=8192)
+        parts = sorted(dest.glob("fmt.7z.*"))
+        assert parts
+        assert not (dest / "fmt.7z").exists()
+        info2 = json.loads((dest / "fmt_hash.json").read_text(encoding="utf-8"))
+        assert info2["split_size"] == 8192
+        assert "Split size changed" in capsys.readouterr().out

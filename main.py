@@ -100,44 +100,25 @@ def parse_size(size_str: Optional[str]) -> Optional[int]:
     if not size_str:
         return None
     size_str = size_str.strip().lower()
-    if size_str.endswith('k'):
-        multiplier = 1024
+    if not size_str:
+        raise argparse.ArgumentTypeError(
+            "Invalid size format: ''. Use k, m, or g suffixes (e.g., 100m)."
+        )
+
+    suffixes = {'k': 1024, 'm': 1024 * 1024, 'g': 1024 * 1024 * 1024}
+    multiplier = 1
+    number_part = size_str
+    last = size_str[-1]
+    if last in suffixes:
+        multiplier = suffixes[last]
         number_part = size_str[:-1]
-        try:
-            numeric = float(number_part)
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
-            )
-    elif size_str.endswith('m'):
-        multiplier = 1024 * 1024
-        number_part = size_str[:-1]
-        try:
-            numeric = float(number_part)
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
-            )
-    elif size_str.endswith('g'):
-        multiplier = 1024 * 1024 * 1024
-        number_part = size_str[:-1]
-        try:
-            numeric = float(number_part)
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
-            )
-    else:
-        multiplier = 1
-        try:
-            numeric = float(size_str)
-            if numeric != int(numeric):
-                raise ValueError
-            numeric = int(numeric)
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
-            )
+
+    try:
+        numeric = float(number_part)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
+        )
 
     if numeric <= 0:
         raise argparse.ArgumentTypeError(
@@ -481,11 +462,14 @@ def main() -> None:
     args = parser.parse_args()
 
     # Скрываем окно консоли в Windows, если запрошено
-    if args.hide and os.name == 'nt':
-        import ctypes
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    if args.hide:
+        if os.name == 'nt':
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)
+        else:
+            logger.warning("--hide is supported only on Windows; ignored on this platform.")
 
     log_overrides = _cli_log_overrides(args)
     if log_overrides is False:
