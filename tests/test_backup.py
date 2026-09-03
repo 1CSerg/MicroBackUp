@@ -58,14 +58,10 @@ class TestGetAllPathsAndCount:
         assert files_count == 3
         assert dirs_count == 2
 
-    def test_missing_source_is_skipped(self, tmp_path: Path):
-        paths = get_all_paths([str(tmp_path / "does_not_exist")])
-        assert paths == []
-        assert count_items(paths) == (0, 0)
-
-    def test_missing_source_logs_warning(self, tmp_path: Path, capsys):
-        get_all_paths([str(tmp_path / "does_not_exist")])
-        assert "does not exist" in capsys.readouterr().err
+    def test_missing_source_raises(self, tmp_path: Path):
+        with pytest.raises(FileNotFoundError, match="Source path does not exist"):
+            get_all_paths([str(tmp_path / "does_not_exist")])
+        assert count_items([]) == (0, 0)
 
     def test_distinct_rel_paths_for_same_basename_file_sources(self, tmp_path: Path):
         dir_a = tmp_path / "A"

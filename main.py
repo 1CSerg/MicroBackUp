@@ -25,6 +25,10 @@ LOGGER_NAME = "microbackup"
 DEFAULT_LOG_LEVEL = logging.INFO
 DEFAULT_LOG_BACKUP_COUNT = 3
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+PASSWORD_ENV_VAR = "MICROBACKUP_PASSWORD"
+
+# Sentinel for "value not provided" (distinct from None which means "explicitly empty").
+_UNSET = object()
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -178,6 +182,39 @@ def parse_log_backup_count(value: Any, context: str) -> int:
         return count
     except (TypeError, ValueError):
         raise ConfigError(f"{context}: invalid log_backup_count '{value}'. Use a non-negative integer.")
+
+
+def _get_boolean(parser: configparser.ConfigParser, section: str, option: str, context: str, fallback: bool = False) -> bool:
+    """Read a boolean option, raising ConfigError on a malformed value."""
+    if not parser.has_option(section, option):
+        return fallback
+    try:
+        return parser.getboolean(section, option)
+    except ValueError as e:
+        raw = parser.get(section, option)
+        raise ConfigError(
+            f"{context}: invalid boolean '{raw}'. Use true or false."
+        ) from e
+
+
+def _resolve_password(
+    cli_password: Optional[str] = None,
+    section_password: Any = _UNSET,
+    global_password: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the archive password with priority: CLI > section (explicit, incl. empty) > env > global.
+
+    `section_password` uses the _UNSET sentinel to distinguish "option absent"
+    (fall through to env/global) from "option present but empty" (disable password).
+    """
+    if cli_password is not None:
+        return cli_password
+    if section_password is not _UNSET:
+        return section_password
+    env = os.environ.get(PASSWORD_ENV_VAR)
+    if env:
+        return env
+    return global_password
 
 
 _WINDOWS_RESERVED_NAMES = frozenset(
@@ -338,7 +375,7 @@ def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = 
                 split_raw = parser.get(section, 'split', fallback=None)
                 global_split = parse_optional_size(split_raw, f"[{section}] split")
                 global_password = parser.get(section, 'password', fallback=None) or None
-                global_check_content_hash = parser.getboolean(section, 'check_content_hash', fallback=False)
+                global_check_content_hash = _get_boolean(parser, section, 'check_content_hash', f"[{section}] check_content_hash")
             else:
                 job_sections.append(section)
     except ConfigError as e:
@@ -388,12 +425,18 @@ def run_from_config(config_path: str, log_overrides: Optional[dict[str, Any]] = 
             split_size = global_split
 
         if parser.has_option(section, 'password'):
-            password = parser.get(section, 'password').strip() or None
+            section_password = parser.get(section, 'password').strip() or None
         else:
-            password = global_password
+            section_password = _UNSET
+        password = _resolve_password(None, section_password, global_password)
 
         if parser.has_option(section, 'check_content_hash'):
-            check_content_hash = parser.getboolean(section, 'check_content_hash')
+            try:
+                check_content_hash = _get_boolean(parser, section, 'check_content_hash', f"[{section}] check_content_hash")
+            except ConfigError as e:
+                logger.error(f"Error: {e}")
+                any_failed = True
+                continue
         else:
             check_content_hash = cli_check_content_hash or global_check_content_hash
 
@@ -509,7 +552,7 @@ def main() -> None:
             if hwnd:
                 ctypes.windll.user32.ShowWindow(hwnd, 0)
         else:
-            logger.warning("--hide is supported only on Windows; ignored on this platform.")
+            logger.info("--hide is supported only on Windows; ignored on this platform.")
 
     try:
         log_overrides = _cli_log_overrides(args)
@@ -535,7 +578,7 @@ def main() -> None:
     if not args.sources or not args.dest or not args.name:
         parser.error("the following arguments are required: -s/--sources, -d/--dest, -n/--name (or use -c/--config)")
 
-    if not execute_backup(args.sources, args.dest, args.name, args.split, args.password, args.check_content_hash):
+    if not execute_backup(args.sources, args.dest, args.name, args.split, _resolve_password(args.password), args.check_content_hash):
         sys.exit(1)
 
 

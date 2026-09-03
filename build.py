@@ -30,7 +30,7 @@ def run_build(name, noconsole=False):
         "--name", name
     ]
     
-    if noconsole:
+    if noconsole and os.name == 'nt':
         command.append("--noconsole")
         
     command.append("main.py")

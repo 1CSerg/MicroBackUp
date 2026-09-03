@@ -58,7 +58,7 @@ def get_all_paths(sources: list[str]) -> list[tuple[str, str, str]]:
                     f_rel = f_path.relative_to(parent_dir)
                     _add(f_path, str(f_rel), 'file')
         else:
-            logger.warning(f"Source path does not exist, skipping: {src}")
+            raise FileNotFoundError(f"Source path does not exist: {src}")
 
     return all_paths
 

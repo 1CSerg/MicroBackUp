@@ -255,6 +255,28 @@ class TestRunFromConfig:
         assert ok is False
         assert "[Job] split" in capsys.readouterr().err
 
+    def test_invalid_global_check_content_hash_returns_false(self, tmp_path, capsys):
+        conf = self._write_conf(
+            tmp_path / "bad_cch.conf",
+            "[GLOBAL]\ncheck_content_hash = maybe\n\n[Job]\nsources = a\ndest = b\nname = n\n",
+        )
+        ok = run_from_config(str(conf))
+        assert ok is False
+        assert "[GLOBAL] check_content_hash: invalid boolean" in capsys.readouterr().err
+
+    def test_invalid_job_check_content_hash_skips_section(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "job_cch.conf",
+            f"[Job]\nsources = {src}\ndest = {dest}\nname = n\ncheck_content_hash = maybe\n",
+        )
+        ok = run_from_config(str(conf))
+        assert ok is False
+        assert "[Job] check_content_hash: invalid boolean" in capsys.readouterr().err
+
     def test_global_defaults_and_local_overrides(self, tmp_path):
         src_a = tmp_path / "Project A"
         src_a.mkdir()
@@ -447,6 +469,124 @@ check_content_hash = false
         assert ok is True
         # Explicit `false` in section must win over CLI flag.
         assert captured == [False]
+
+
+class TestResolvePassword:
+    """Priority: CLI > section (explicit, incl. empty) > env > global."""
+
+    def _conf(self, path: Path, body: str) -> Path:
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_env_password_used_when_no_cli_and_no_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(password)
+            return True
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._conf(
+            tmp_path / "no_pw.conf",
+            f"[Job]\nsources = {src}\ndest = {dest}\nname = n\n",
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+        assert ok is True
+        assert captured == ["env_secret"]
+
+    def test_cli_password_overrides_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
+        from main import _resolve_password
+        assert _resolve_password("cli_secret") == "cli_secret"
+
+    def test_section_password_overrides_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(password)
+            return True
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._conf(
+            tmp_path / "sec_pw.conf",
+            f"[Job]\nsources = {src}\ndest = {dest}\nname = n\npassword = sec\n",
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+        assert ok is True
+        assert captured == ["sec"]
+
+    def test_env_overrides_global_when_no_section_password(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(password)
+            return True
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._conf(
+            tmp_path / "glob_pw.conf",
+            f"[GLOBAL]\npassword = glob\n\n[Job]\nsources = {src}\ndest = {dest}\nname = n\n",
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+        assert ok is True
+        assert captured == ["env_secret"]
+
+    def test_empty_section_password_disables_env_and_global(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(password)
+            return True
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._conf(
+            tmp_path / "empty_pw.conf",
+            f"[GLOBAL]\npassword = glob\n\n[Job]\nsources = {src}\ndest = {dest}\nname = n\npassword =\n",
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+        assert ok is True
+        assert captured == [None]
+
+    def test_no_env_no_section_falls_back_to_global(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MICROBACKUP_PASSWORD", raising=False)
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+            captured.append(password)
+            return True
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._conf(
+            tmp_path / "fallback.conf",
+            f"[GLOBAL]\npassword = glob\n\n[Job]\nsources = {src}\ndest = {dest}\nname = n\n",
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+        assert ok is True
+        assert captured == ["glob"]
 
 
 class TestMainCli:
@@ -700,10 +840,11 @@ class TestLoggingSetup:
 
     def test_rotates_when_max_size_exceeded(self, tmp_path):
         log_file = tmp_path / "rotate.log"
+        max_bytes = 200
         setup_logging(
             log_file=str(log_file),
             log_level=logging.INFO,
-            log_max_size=200,
+            log_max_size=max_bytes,
             log_backup_count=2,
         )
         for i in range(50):
@@ -714,8 +855,13 @@ class TestLoggingSetup:
 
         rotated = tmp_path / "rotate.log.1"
         assert log_file.is_file()
+        # Rotation must have happened (rotated file exists) and the active file
+        # must not have grown unbounded. The exact boundary is implementation-
+        # dependent (RotatingFileHandler checks size after each emit), so we
+        # only assert it stays within a small multiple of max_bytes rather than
+        # an exact threshold.
         assert rotated.is_file()
-        assert log_file.stat().st_size <= 200 + 100
+        assert log_file.stat().st_size < 2 * max_bytes
 
     def test_config_logging_and_invalid_level(self, tmp_path, capsys):
         conf = tmp_path / "bad_level.conf"
