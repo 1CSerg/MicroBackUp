@@ -16,7 +16,8 @@ import multivolumefile
 import py7zr
 from pathspec import GitIgnoreSpec
 
-from sevenzip import SevenZipError, SevenZipOptions, create_archive as sevenzip_create_archive
+from sevenzip import SevenZipError, SevenZipOptions
+from sevenzip import create_archive as sevenzip_create_archive
 
 logger = logging.getLogger("microbackup")
 
@@ -82,7 +83,7 @@ class ExcludeSpec:
                 if regex is not None:
                     originals.append((pattern, regex))
                     pattern.regex = re.compile(regex.pattern, regex.flags | re.IGNORECASE)
-        except Exception:
+        except (AttributeError, TypeError, RuntimeError, re.error):
             for pattern, regex in originals:
                 pattern.regex = regex
             logger.warning(
@@ -230,7 +231,7 @@ def source_containing_dest(dest: str, sources: list[str]) -> str | None:
 
 def _legacy_password_hash(password: str, salt: str) -> str:
     """Previous SHA-256(salt:password) verifier; kept to read old hash files."""
-    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
 
 
 def _pbkdf2_password_hash(password: str, salt: str, iterations: int) -> str:
@@ -712,9 +713,9 @@ def run_backup(sources: list[str], dest: str, archive_name: str, split_size: int
             with open(info_file, "r", encoding="utf-8-sig") as f:
                 loaded = json.load(f)
             if not isinstance(loaded, dict):
-                raise ValueError("info file must contain a JSON object")
+                raise TypeError("info file must contain a JSON object")
             old_info = loaded
-        except (OSError, ValueError) as e:
+        except (OSError, TypeError, ValueError) as e:
             logger.error(f"Error reading info file {info_file}: {e}. Will perform full backup.")
             old_info = None
 

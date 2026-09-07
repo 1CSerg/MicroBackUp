@@ -331,7 +331,7 @@ class TestExecuteBackup:
         dest = tmp_path / "dest"
         dest.mkdir()
 
-        with patch("main.run_backup", side_effect=Exception("py7zr archive exploded")):
+        with patch("main.run_backup", side_effect=RuntimeError("py7zr archive exploded")):
             ok = execute_backup([str(src)], str(dest), "arc", None, None)
 
         assert ok is False
@@ -699,7 +699,7 @@ name = good
             name = kwargs.get("archive_name", args[2] if len(args) > 2 else None)
             names.append(name)
             if name == "bad":
-                raise Exception("archive exploded")
+                raise RuntimeError("archive exploded")
 
         with patch("main.run_backup", side_effect=fake_run):
             ok = run_from_config(str(conf))

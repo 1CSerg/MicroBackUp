@@ -282,8 +282,7 @@ def _7z_list_names(archive: Path) -> set[str]:
     assert SEVENZIP_BIN is not None
     result = subprocess.run(
         [SEVENZIP_BIN, "l", "-ba", str(archive)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     names: set[str] = set()
@@ -355,8 +354,7 @@ class TestRealSevenZip:
         assert first.is_file()
         result = subprocess.run(
             [SEVENZIP_BIN, "t", str(first)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
         assert result.returncode in (0, 1)
@@ -374,15 +372,13 @@ class TestRealSevenZip:
         )
         denied = subprocess.run(
             [SEVENZIP_BIN, "t", str(archive)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
         assert denied.returncode != 0
         ok = subprocess.run(
             [SEVENZIP_BIN, "t", "-ps3cret", str(archive)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
         assert ok.returncode == 0

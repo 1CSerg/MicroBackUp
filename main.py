@@ -21,8 +21,8 @@ try:
         _validate_archive_name,
         build_exclude_spec,
         run_backup,
-        source_containing_dest as _source_containing_dest,
     )
+    from backup import source_containing_dest as _source_containing_dest
 except ImportError as _exc:  # pragma: no cover - depends on runtime environment
     run_backup = None  # type: ignore[assignment]
     build_exclude_spec = None  # type: ignore[assignment]
@@ -436,7 +436,7 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
             sevenzip=sevenzip,
             compression_level=compression_level,
         )
-    except Exception as e:
+    except (OSError, ValueError, TypeError, RuntimeError) as e:
         logger.error(f"Backup failed: {e}")
         return False
 

@@ -8,9 +8,9 @@ import py7zr
 import pytest
 
 from backup import (
-    ExcludeError,
-    _PBKDF2_ITERATIONS,
     _PASSWORD_KDF,
+    _PBKDF2_ITERATIONS,
+    ExcludeError,
     _build_filters,
     _legacy_password_hash,
     _unique_root_arcname,
@@ -1018,7 +1018,11 @@ class TestPasswordVerifier:
         assert _password_matches("secret", info) is False
 
     def test_password_matches_rejects_huge_or_bool_iterations(self):
-        from backup import _PBKDF2_MAX_ITERATIONS, _new_password_verifier, _password_matches
+        from backup import (
+            _PBKDF2_MAX_ITERATIONS,
+            _new_password_verifier,
+            _password_matches,
+        )
 
         info = _new_password_verifier("secret")
         info["password_iterations"] = _PBKDF2_MAX_ITERATIONS + 1
