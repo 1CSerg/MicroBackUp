@@ -10,6 +10,7 @@ import pytest
 
 from main import (
     ConfigError,
+    _unquote_path,
     execute_backup,
     logger,
     main,
@@ -84,6 +85,27 @@ class TestParseSources:
 
     def test_empty_string(self):
         assert parse_sources("") == []
+
+
+class TestUnquotePath:
+    def test_strips_double_quotes(self):
+        assert _unquote_path(r'"E:\root\cloud\mail\BackUp (sync)"') == r"E:\root\cloud\mail\BackUp (sync)"
+
+    def test_strips_single_quotes(self):
+        assert _unquote_path(r"'E:\root\cloud\mail\BackUp_sync'") == r"E:\root\cloud\mail\BackUp_sync"
+
+    def test_strips_whitespace_around_quotes(self):
+        assert _unquote_path('  "D:\\Backups"  ') == r"D:\Backups"
+
+    def test_unquoted_path_unchanged(self):
+        assert _unquote_path(r"E:\root\cloud\mail\BackUp (sync)") == r"E:\root\cloud\mail\BackUp (sync)"
+
+    def test_unbalanced_quotes_unchanged(self):
+        assert _unquote_path(r'"E:\path') == r'"E:\path'
+
+    def test_empty_quotes_become_empty(self):
+        assert _unquote_path('""') == ""
+        assert _unquote_path("''") == ""
 
 
 class TestParseOptionalSize:
@@ -174,6 +196,18 @@ class TestExecuteBackup:
         assert dest.is_dir()
         assert (dest / "arc.7z").is_file()
         assert (dest / "arc_hash.json").is_file()
+
+    def test_quoted_dest_with_spaces_creates_directory(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+        dest = tmp_path / "BackUp (sync)"
+
+        ok = execute_backup([str(src)], f'"{dest}"', "arc", None, None)
+
+        assert ok is True
+        assert dest.is_dir()
+        assert (dest / "arc.7z").is_file()
 
     def test_backup_exception_returns_false(self, tmp_path, capsys):
         src = tmp_path / "src"
@@ -382,6 +416,22 @@ password = specific_secret
         assert job_b["split_size"] == 500 * 1024 * 1024
         assert job_b["password"] == "specific_secret"
         assert job_b["check_content_hash"] is False
+
+    def test_quoted_dest_with_spaces_is_unquoted(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "BackUp (sync)"
+        conf = self._write_conf(
+            tmp_path / "quoted_dest.conf",
+            f'[Job]\nsources = {src}\ndest = "{dest}"\nname = n\n',
+        )
+
+        ok = run_from_config(str(conf))
+
+        assert ok is True
+        assert dest.is_dir()
+        assert (dest / "n.7z").is_file()
 
     def test_config_check_content_hash(self, tmp_path):
         src = tmp_path / "src"

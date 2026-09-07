@@ -190,6 +190,19 @@ def parse_sources(sources_str: str) -> list[str]:
     return [m[0] or m[1] or m[2] for m in matches]
 
 
+def _unquote_path(value: str) -> str:
+    """Strip matching surrounding quotes from a path.
+
+    INI dest values are often quoted the same way as sources (especially when
+    the path contains spaces). A leading quote is not a valid path character
+    on Windows and produces WinError 123 ('"E:').
+    """
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value
+
+
 def parse_log_level(value: Any, context: str) -> int:
     if not value:
         return DEFAULT_LOG_LEVEL
@@ -254,6 +267,8 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
             f"Install runtime dependencies: pip install -r requirements.txt"
         )
         return False
+
+    dest = _unquote_path(dest)
 
     if not sources:
         logger.error("Error: Sources list is empty")
@@ -416,7 +431,7 @@ def run_from_config(
     for section in job_sections:
         logger.info(f"\n=== Section [{section}] ===")
         sources_str = parser.get(section, 'sources', fallback='').strip()
-        dest = parser.get(section, 'dest', fallback='').strip()
+        dest = _unquote_path(parser.get(section, 'dest', fallback=''))
         name = parser.get(section, 'name', fallback='').strip()
 
         missing = [field for field, value in (('sources', sources_str), ('dest', dest), ('name', name)) if not value]
