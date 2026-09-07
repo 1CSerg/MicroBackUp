@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 
 import multivolumefile
@@ -7,6 +8,13 @@ import py7zr
 import pytest
 
 from backup import (
+    ExcludeError,
+    _PBKDF2_ITERATIONS,
+    _PASSWORD_KDF,
+    _build_filters,
+    _legacy_password_hash,
+    _unique_root_arcname,
+    build_exclude_spec,
     compute_content_hash,
     compute_file_hash,
     compute_metadata_hash,
@@ -15,6 +23,7 @@ from backup import (
     create_archive,
     get_all_paths,
     run_backup,
+    source_containing_dest,
 )
 
 # Wrong/missing password surfaces as PasswordRequired, Bad7zFile, or TypeError
@@ -72,6 +81,52 @@ class TestGetAllPathsAndCount:
         with pytest.raises(FileNotFoundError, match="Source path does not exist"):
             get_all_paths([str(tmp_path / "does_not_exist")])
         assert count_items([]) == (0, 0)
+
+    def test_empty_root_name_raises(self, tmp_path: Path):
+        with pytest.raises(ValueError, match="no archive root name"):
+            _unique_root_arcname("", set(), tmp_path)
+
+    def test_source_root_name_for_anchor(self, tmp_path: Path):
+        from backup import _source_root_name
+
+        name = _source_root_name(Path(tmp_path.anchor))
+        assert name
+        assert "/" not in name
+        assert "\\" not in name
+
+    def test_sevenzip_skip_reason_empty_name_source(self, tmp_path: Path):
+        from backup import _sevenzip_skip_reason, _source_root_name
+
+        root = Path(tmp_path.anchor)
+        assert root.name == ""
+        reason = _sevenzip_skip_reason([str(root)], None)
+        assert reason is not None
+        assert "synthesized archive root" in reason
+        assert _source_root_name(root) in reason
+
+    def test_duplicate_source_paths_are_deduped(self, tmp_path: Path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("x", encoding="utf-8")
+        paths = get_all_paths([str(src), str(src)])
+        assert sum(1 for _abs, _rel, kind in paths if kind == "file") == 1
+        assert "Duplicate source path skipped" in capsys.readouterr().err
+
+    def test_case_colliding_root_names_are_renamed_on_windows(self, tmp_path: Path):
+        src_a = tmp_path / "A" / "Project"
+        src_b = tmp_path / "B" / "project"
+        src_a.mkdir(parents=True)
+        src_b.mkdir(parents=True)
+        (src_a / "a.txt").write_text("a", encoding="utf-8")
+        (src_b / "b.txt").write_text("b", encoding="utf-8")
+        paths = get_all_paths([str(src_a), str(src_b)])
+        roots = {
+            rel.replace("\\", "/").split("/")[0]
+            for _abs, rel, _kind in paths
+        }
+        assert len(roots) == 2
+        if os.name == "nt":
+            assert {r.lower() for r in roots} == {"project", "project_1"}
 
     def test_distinct_rel_paths_for_same_basename_file_sources(self, tmp_path: Path):
         dir_a = tmp_path / "A"
@@ -301,6 +356,35 @@ class TestBackupIntegration:
         run_backup([str(src)], str(dest), "bad")
         assert (dest / "bad.7z").is_file()
         assert "Error reading info file" in capsys.readouterr().err
+
+    def test_hash_json_array_triggers_full_backup(self, tmp_path: Path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("data", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "arr.7z").write_bytes(b"dummy")
+        (dest / "arr_hash.json").write_text("[]", encoding="utf-8")
+
+        run_backup([str(src)], str(dest), "arr")
+        assert "Error reading info file" in capsys.readouterr().err
+        assert (dest / "arr.7z").is_file()
+        info = json.loads((dest / "arr_hash.json").read_text(encoding="utf-8"))
+        assert isinstance(info, dict)
+
+    def test_hash_json_with_bom_still_skips_unchanged(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("stable", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        run_backup([str(src)], str(dest), "bom")
+        info_path = dest / "bom_hash.json"
+        payload = info_path.read_bytes()
+        info_path.write_bytes(b"\xef\xbb\xbf" + payload)
+        mtime_before = (dest / "bom.7z").stat().st_mtime
+        run_backup([str(src)], str(dest), "bom")
+        assert (dest / "bom.7z").stat().st_mtime == mtime_before
 
     def test_split_archive_into_volumes(self, tmp_path: Path):
         src = tmp_path / "src"
@@ -582,13 +666,141 @@ class TestBackupIntegration:
         (src / "f.txt").write_text("new", encoding="utf-8")
 
         with (
-            patch("py7zr.SevenZipFile.writeall", side_effect=RuntimeError("compression failed")),
+            patch("py7zr.SevenZipFile.write", side_effect=RuntimeError("compression failed")),
             pytest.raises(RuntimeError, match="compression failed"),
         ):
             create_archive([str(src)], str(dest), "arc", None, None)
 
         assert (dest / "arc.7z").is_file()
         assert (dest / "arc.7z").read_bytes() == orig_content
+
+    def test_create_archive_rollback_on_keyboard_interrupt(self, tmp_path: Path):
+        from unittest.mock import patch
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("orig", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        create_archive([str(src)], str(dest), "arc", None, None)
+        orig_content = (dest / "arc.7z").read_bytes()
+
+        (src / "f.txt").write_text("new", encoding="utf-8")
+
+        with (
+            patch("py7zr.SevenZipFile.write", side_effect=KeyboardInterrupt()),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            create_archive([str(src)], str(dest), "arc", None, None)
+
+        assert (dest / "arc.7z").is_file()
+        assert (dest / "arc.7z").read_bytes() == orig_content
+
+    def test_create_archive_interrupt_during_temp_cleanup_keeps_new_archive(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("orig", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        create_archive([str(src)], str(dest), "arc", None, None)
+        (src / "f.txt").write_text("new", encoding="utf-8")
+
+        with (
+            patch("backup.shutil.rmtree", side_effect=KeyboardInterrupt()),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            create_archive([str(src)], str(dest), "arc", None, None)
+
+        assert (dest / "arc.7z").is_file()
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "arc.7z", extracted)
+        assert (extracted / "src" / "f.txt").read_text(encoding="utf-8") == "new"
+
+    def test_create_archive_interrupt_during_collect_keeps_new_archive(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("orig", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        create_archive([str(src)], str(dest), "arc", None, None)
+        (src / "f.txt").write_text("new", encoding="utf-8")
+
+        with (
+            patch("backup._collect_created_volumes", side_effect=KeyboardInterrupt()),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            create_archive([str(src)], str(dest), "arc", None, None)
+
+        assert (dest / "arc.7z").is_file()
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "arc.7z", extracted)
+        assert (extracted / "src" / "f.txt").read_text(encoding="utf-8") == "new"
+
+    def test_create_archive_restores_if_moving_old_files_fails(self, tmp_path: Path):
+        import shutil
+        from unittest.mock import patch
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("orig", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        create_archive([str(src)], str(dest), "arc", None, None)
+        orig_content = (dest / "arc.7z").read_bytes()
+        extra = dest / "arc.7z.0001"
+        extra.write_bytes(b"volume")
+
+        real_move = shutil.move
+        into_temp = {"n": 0}
+
+        def flaky_move(src_p, dst_p):
+            if ".microbackup_tmp_" in str(dst_p):
+                into_temp["n"] += 1
+                if into_temp["n"] >= 2:
+                    raise OSError("simulated lock")
+            return real_move(src_p, dst_p)
+
+        with (
+            patch("backup.shutil.move", side_effect=flaky_move),
+            pytest.raises(OSError, match="simulated lock"),
+        ):
+            create_archive([str(src)], str(dest), "arc", None, None)
+
+        assert (dest / "arc.7z").read_bytes() == orig_content
+        assert (dest / "arc.7z.0001").read_bytes() == b"volume"
+
+    def test_create_archive_preserves_original_error_if_restore_fails(self, tmp_path: Path):
+        import shutil
+        from unittest.mock import patch
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("orig", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        create_archive([str(src)], str(dest), "arc", None, None)
+
+        real_move = shutil.move
+
+        def move_restore_fails(src_p, dst_p):
+            if ".microbackup_tmp_" in str(dst_p):
+                return real_move(src_p, dst_p)
+            raise OSError("restore denied")
+
+        with (
+            patch("py7zr.SevenZipFile.write", side_effect=RuntimeError("compression failed")),
+            patch("backup.shutil.move", side_effect=move_restore_fails),
+            pytest.raises(RuntimeError, match="compression failed"),
+        ):
+            create_archive([str(src)], str(dest), "arc", None, None)
 
     def test_duplicate_source_names_without_extension(self, tmp_path: Path):
         src1 = tmp_path / "src1" / "folder"
@@ -663,6 +875,7 @@ class TestPasswordChangeDetection:
         info1 = json.loads(info_file.read_text(encoding="utf-8"))
         assert info1.get("has_password") is False
         assert "password_hash" not in info1
+        assert "password_kdf" not in info1
 
         # Unencrypted archive can be extracted without password
         out1 = tmp_path / "out1"
@@ -675,6 +888,8 @@ class TestPasswordChangeDetection:
         assert info2.get("has_password") is True
         assert "password_hash" in info2
         assert "password_salt" in info2
+        assert info2.get("password_kdf") == _PASSWORD_KDF
+        assert info2.get("password_iterations") == _PBKDF2_ITERATIONS
         assert info2["last_update_date"] != info1["last_update_date"]
 
         # Extraction without password should fail
@@ -734,6 +949,123 @@ class TestPasswordChangeDetection:
         _extract_archive(dest / "pw_arc.7z", out_open, password=None)
         assert (out_open / "single.txt").read_text(encoding="utf-8") == "file"
 
+    def test_legacy_sha256_verifier_same_password_skips(self, source_tree: Path, tmp_path: Path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        sources = [str(source_tree / "single.txt")]
+
+        run_backup(sources, str(dest), "pw_arc", password="secret")
+        info_file = dest / "pw_arc_hash.json"
+        info = json.loads(info_file.read_text(encoding="utf-8"))
+        salt = info["password_salt"]
+        info.pop("password_kdf", None)
+        info.pop("password_iterations", None)
+        info["password_hash"] = _legacy_password_hash("secret", salt)
+        info_file.write_text(json.dumps(info), encoding="utf-8")
+        mtime_before = (dest / "pw_arc.7z").stat().st_mtime
+
+        run_backup(sources, str(dest), "pw_arc", password="secret")
+
+        assert (dest / "pw_arc.7z").stat().st_mtime == mtime_before
+        info_after = json.loads(info_file.read_text(encoding="utf-8"))
+        assert info_after["last_update_date"] == info["last_update_date"]
+        assert info_after.get("password_kdf") == _PASSWORD_KDF
+        assert info_after.get("password_iterations") == _PBKDF2_ITERATIONS
+
+    def test_legacy_sha256_verifier_new_password_rebuilds(self, source_tree: Path, tmp_path: Path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        sources = [str(source_tree / "single.txt")]
+
+        run_backup(sources, str(dest), "pw_arc", password="old_secret")
+        info_file = dest / "pw_arc_hash.json"
+        info = json.loads(info_file.read_text(encoding="utf-8"))
+        salt = info["password_salt"]
+        info.pop("password_kdf", None)
+        info.pop("password_iterations", None)
+        info["password_hash"] = _legacy_password_hash("old_secret", salt)
+        info_file.write_text(json.dumps(info), encoding="utf-8")
+
+        run_backup(sources, str(dest), "pw_arc", password="new_secret")
+
+        info_after = json.loads(info_file.read_text(encoding="utf-8"))
+        assert info_after["last_update_date"] != info["last_update_date"]
+        assert info_after.get("password_kdf") == _PASSWORD_KDF
+        out = tmp_path / "out"
+        _extract_archive(dest / "pw_arc.7z", out, password="new_secret")
+        assert (out / "single.txt").read_text(encoding="utf-8") == "file"
+
+
+class TestPasswordVerifier:
+    def test_password_matches_pbkdf2_and_rejects_unknown_kdf(self):
+        from backup import _new_password_verifier, _password_matches
+
+        info = _new_password_verifier("secret")
+        assert _password_matches("secret", info) is True
+        assert _password_matches("other", info) is False
+        info["password_kdf"] = "unknown"
+        assert _password_matches("secret", info) is False
+
+    def test_password_matches_rejects_invalid_salt(self):
+        from backup import _password_matches
+
+        info = {
+            "password_salt": "not-hex",
+            "password_hash": "00" * 32,
+            "password_kdf": _PASSWORD_KDF,
+            "password_iterations": 1,
+        }
+        assert _password_matches("secret", info) is False
+
+    def test_password_matches_rejects_huge_or_bool_iterations(self):
+        from backup import _PBKDF2_MAX_ITERATIONS, _new_password_verifier, _password_matches
+
+        info = _new_password_verifier("secret")
+        info["password_iterations"] = _PBKDF2_MAX_ITERATIONS + 1
+        assert _password_matches("secret", info) is False
+        info["password_iterations"] = True
+        assert _password_matches("secret", info) is False
+
+
+class TestDestSafety:
+    def test_run_backup_rejects_dest_inside_source(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+        dest = src / "backups"
+
+        with pytest.raises(ValueError, match="inside a source path"):
+            run_backup([str(src)], str(dest), "arc")
+        assert not dest.exists()
+
+    def test_run_backup_rejects_dest_that_is_a_file(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+        dest = tmp_path / "dest_file.txt"
+        dest.write_text("already a file", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="existing file, not a directory"):
+            run_backup([str(src)], str(dest), "arc")
+
+    def test_create_archive_rejects_dest_inside_source(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+        dest = src / "nested"
+
+        with pytest.raises(ValueError, match="inside a source path"):
+            create_archive([str(src)], str(dest), "arc", None, None)
+        assert not dest.exists()
+
+    def test_source_containing_dest_sibling_is_ok(self, tmp_path: Path):
+        src = tmp_path / "src"
+        dest = tmp_path / "dest"
+        src.mkdir()
+        dest.mkdir()
+        assert source_containing_dest(str(dest), [str(src)]) is None
+        assert source_containing_dest(str(src), [str(src)]) == str(src)
+
 
 class TestArchiveValidationAndCleanup:
     def test_create_archive_initial_failure_cleans_partial_files(self, tmp_path: Path):
@@ -750,7 +1082,7 @@ class TestArchiveValidationAndCleanup:
             raise RuntimeError("disk full during write")
 
         with (
-            patch("backup.py7zr.SevenZipFile.writeall", side_effect=fail_write),
+            patch("backup.py7zr.SevenZipFile.write", side_effect=fail_write),
             pytest.raises(RuntimeError, match="disk full during write"),
         ):
             create_archive([str(src)], str(dest), "fail_arc", None, None)
@@ -809,5 +1141,611 @@ class TestArchiveValidationAndCleanup:
             run_backup([str(src)], str(dest), "arc_content_err", check_content_hash=True)
         assert not (dest / "arc_content_err_hash.json").exists()
 
+
+class TestExcludePatterns:
+    def _rel_posix(self, paths):
+        return {(rel.replace("\\", "/"), kind) for _abs, rel, kind in paths}
+
+    def test_basic_globs_and_directories(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        (src / "noise.log").write_text("log", encoding="utf-8")
+        (src / "build").mkdir()
+        (src / "build" / "out.bin").write_text("bin", encoding="utf-8")
+        (src / "node_modules").mkdir()
+        (src / "node_modules" / "pkg.js").write_text("js", encoding="utf-8")
+        nested_temp = src / "sub" / "temp"
+        nested_temp.mkdir(parents=True)
+        (nested_temp / "t.txt").write_text("tmp", encoding="utf-8")
+        (src / "sub" / "ok.txt").write_text("ok", encoding="utf-8")
+
+        spec = build_exclude_spec(["*.log", "build/", "node_modules", "**/temp/"], case_sensitive=True)
+        rels = self._rel_posix(get_all_paths([str(src)], spec))
+
+        assert ("proj/keep.txt", "file") in rels
+        assert ("proj/sub/ok.txt", "file") in rels
+        assert ("proj/noise.log", "file") not in rels
+        assert ("proj/build", "dir") not in rels
+        assert ("proj/build/out.bin", "file") not in rels
+        assert ("proj/node_modules", "dir") not in rels
+        assert ("proj/node_modules/pkg.js", "file") not in rels
+        assert ("proj/sub/temp", "dir") not in rels
+        assert ("proj/sub/temp/t.txt", "file") not in rels
+
+    def test_negation_restores_file(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "skip.log").write_text("skip", encoding="utf-8")
+        (src / "keep.log").write_text("keep", encoding="utf-8")
+
+        spec = build_exclude_spec(["*.log", "!keep.log"], case_sensitive=True)
+        rels = self._rel_posix(get_all_paths([str(src)], spec))
+        assert ("proj/keep.log", "file") in rels
+        assert ("proj/skip.log", "file") not in rels
+
+    def test_trailing_slash_excludes_only_directory(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "keep").write_text("file", encoding="utf-8")
+        (src / "other").mkdir()
+        (src / "other" / "x.txt").write_text("x", encoding="utf-8")
+
+        spec = build_exclude_spec(["keep/"], case_sensitive=True)
+        rels = self._rel_posix(get_all_paths([str(src)], spec))
+        assert ("proj/keep", "file") in rels
+
+    def test_leading_slash_anchors_to_source_root(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "root_only").write_text("root", encoding="utf-8")
+        sub = src / "sub"
+        sub.mkdir()
+        (sub / "root_only").write_text("nested", encoding="utf-8")
+
+        spec = build_exclude_spec(["/root_only"], case_sensitive=True)
+        rels = self._rel_posix(get_all_paths([str(src)], spec))
+        assert ("proj/root_only", "file") not in rels
+        assert ("proj/sub/root_only", "file") in rels
+
+    def test_patterns_apply_independently_to_each_source(self, tmp_path: Path):
+        src_a = tmp_path / "A"
+        src_b = tmp_path / "B"
+        src_a.mkdir()
+        src_b.mkdir()
+        (src_a / "skip.log").write_text("a", encoding="utf-8")
+        (src_a / "keep.txt").write_text("a", encoding="utf-8")
+        (src_b / "skip.log").write_text("b", encoding="utf-8")
+        (src_b / "keep.txt").write_text("b", encoding="utf-8")
+
+        spec = build_exclude_spec(["*.log"], case_sensitive=True)
+        rels = self._rel_posix(get_all_paths([str(src_a), str(src_b)], spec))
+        assert ("A/keep.txt", "file") in rels
+        assert ("B/keep.txt", "file") in rels
+        assert ("A/skip.log", "file") not in rels
+        assert ("B/skip.log", "file") not in rels
+
+    def test_source_root_and_file_source_are_never_excluded(self, tmp_path: Path):
+        src_dir = tmp_path / "docs"
+        src_dir.mkdir()
+        (src_dir / "a.txt").write_text("a", encoding="utf-8")
+        src_file = tmp_path / "single.txt"
+        src_file.write_text("file", encoding="utf-8")
+
+        spec = build_exclude_spec(["*", "docs", "docs/", "single.txt"], case_sensitive=True)
+        paths = get_all_paths([str(src_dir), str(src_file)], spec)
+        rels = self._rel_posix(paths)
+        assert ("docs", "dir") in rels
+        assert ("single.txt", "file") in rels
+        assert ("docs/a.txt", "file") not in rels
+
+    def test_excluded_directory_is_not_walked(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        src = tmp_path / "proj"
+        src.mkdir()
+        skipped = src / "node_modules"
+        skipped.mkdir()
+        (skipped / "pkg.js").write_text("js", encoding="utf-8")
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+
+        scanned: list[str] = []
+        real_scandir = os.scandir
+
+        def spy(path):
+            scanned.append(str(path))
+            return real_scandir(path)
+
+        spec = build_exclude_spec(["node_modules/"], case_sensitive=True)
+        with patch("backup.os.scandir", side_effect=spy):
+            get_all_paths([str(src)], spec)
+
+        assert not any(Path(p).name == "node_modules" for p in scanned)
+
+    def test_case_sensitivity_modes(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "Temp").mkdir()
+        (src / "Temp" / "x.txt").write_text("x", encoding="utf-8")
+
+        insensitive = build_exclude_spec(["temp/"], case_sensitive=False)
+        sensitive = build_exclude_spec(["temp/"], case_sensitive=True)
+        ins_rels = self._rel_posix(get_all_paths([str(src)], insensitive))
+        sen_rels = self._rel_posix(get_all_paths([str(src)], sensitive))
+
+        assert ("proj/Temp", "dir") not in ins_rels
+        assert ("proj/Temp", "dir") in sen_rels
+        assert ("proj/Temp/x.txt", "file") not in ins_rels
+        assert ("proj/Temp/x.txt", "file") in sen_rels
+
+    def test_invalid_pattern_raises_exclude_error(self):
+        with pytest.raises(ExcludeError, match=r"Invalid exclude pattern: '!'"):
+            build_exclude_spec(["!"])
+        assert build_exclude_spec(None) is None
+        assert build_exclude_spec([]) is None
+
+    def test_ignorecase_falls_back_when_regex_patch_fails(self, capsys):
+        from unittest.mock import patch
+
+        original_compile = re.compile
+
+        def boom(pattern, flags=0):
+            if flags & re.IGNORECASE:
+                raise RuntimeError("cannot retarget flags")
+            return original_compile(pattern, flags)
+
+        with patch("backup.re.compile", side_effect=boom):
+            spec = build_exclude_spec(["Temp/"], case_sensitive=False)
+        assert spec is not None
+        captured = capsys.readouterr()
+        assert "case-insensitive exclude matching" in captured.out or "case-insensitive exclude matching" in captured.err
+
+    def test_run_backup_omits_excluded_entries(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        (src / "skip.log").write_text("skip", encoding="utf-8")
+        (src / "keep.log").write_text("keep-log", encoding="utf-8")
+        build = src / "build"
+        build.mkdir()
+        (build / "out.bin").write_text("bin", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "ex", exclude=["*.log", "build/", "!keep.log"])
+
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "ex.7z", extracted)
+        files = _file_map(extracted)
+        assert files["proj/keep.txt"] == b"keep"
+        assert files["proj/keep.log"] == b"keep-log"
+        assert "proj/skip.log" not in files
+        assert "proj/build/out.bin" not in files
+
+    def test_hash_file_matches_filtered_set_and_skips_unchanged(self, tmp_path: Path, capsys):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        (src / "skip.log").write_text("skip", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "ex", exclude=["*.log"])
+        info = json.loads((dest / "ex_hash.json").read_text(encoding="utf-8"))
+        spec = build_exclude_spec(["*.log"], case_sensitive=True)
+        files_count, dirs_count = count_items(get_all_paths([str(src)], spec))
+        assert info["files_count"] == files_count
+        assert info["dirs_count"] == dirs_count
+
+        capsys.readouterr()
+        run_backup([str(src)], str(dest), "ex", exclude=["*.log"])
+        captured = capsys.readouterr()
+        assert "No backup needed" in captured.out or "No backup needed" in captured.err
+
+    def test_changing_patterns_forces_rebuild(self, tmp_path: Path, capsys):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "a.txt").write_text("a", encoding="utf-8")
+        (src / "b.log").write_text("b", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "ex", exclude=["*.log"])
+        first = json.loads((dest / "ex_hash.json").read_text(encoding="utf-8"))
+
+        capsys.readouterr()
+        run_backup([str(src)], str(dest), "ex", exclude=["*.txt"])
+        captured = capsys.readouterr()
+        assert "No backup needed" not in captured.out
+        second = json.loads((dest / "ex_hash.json").read_text(encoding="utf-8"))
+        assert second["names_hash"] != first["names_hash"]
+
+    def test_excluding_all_files_raises(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "a.txt").write_text("a", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        with pytest.raises(ValueError, match="All files are excluded by exclude patterns"):
+            run_backup([str(src)], str(dest), "ex", exclude=["*"])
+
+    def test_empty_directory_is_kept_when_files_are_excluded(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        emptyish = src / "keepdir"
+        emptyish.mkdir()
+        (emptyish / "gone.log").write_text("gone", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        run_backup([str(src)], str(dest), "ex", exclude=["*.log"])
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "ex.7z", extracted)
+        assert (extracted / "proj" / "keep.txt").read_text(encoding="utf-8") == "keep"
+        assert (extracted / "proj" / "keepdir").is_dir()
+        assert not (extracted / "proj" / "keepdir" / "gone.log").exists()
+
+
+class TestExcludedOut:
+    def test_collects_excluded_files_and_dirs(self, tmp_path: Path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        (src / "skip.log").write_text("skip", encoding="utf-8")
+        build = src / "build"
+        build.mkdir()
+        (build / "out.bin").write_text("out", encoding="utf-8")
+
+        excluded: list[str] = []
+        spec = build_exclude_spec(["build/", "*.log"])
+        paths = get_all_paths([str(src)], spec, excluded_out=excluded)
+        rels = {rel.replace("\\", "/") for _abs, rel, _kind in paths}
+        assert "proj/keep.txt" in rels
+        assert "proj/skip.log" not in rels
+        assert "proj/build" not in rels
+        excluded_norm = {e.replace("\\", "/") for e in excluded}
+        assert "proj/skip.log" in excluded_norm
+        assert "proj/build" in excluded_norm
+
+
+class TestBuildFilters:
+    def test_none_level_returns_none(self):
+        assert _build_filters(None, None) is None
+        assert _build_filters(None, "secret") is None
+
+    def test_level_zero_uses_copy(self):
+        filters = _build_filters(0, None)
+        assert filters == [{"id": py7zr.FILTER_COPY}]
+
+    def test_level_with_lzma2_preset(self):
+        filters = _build_filters(7, None)
+        assert filters == [{"id": py7zr.FILTER_LZMA2, "preset": 7}]
+
+    def test_password_appends_aes(self):
+        filters = _build_filters(1, "secret")
+        assert filters[-1] == {"id": py7zr.FILTER_CRYPTO_AES256_SHA256}
+        assert filters[0] == {"id": py7zr.FILTER_LZMA2, "preset": 1}
+
+
+class TestCompressionLevelArchives:
+    def test_password_with_compression_level_encrypts(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "secret.txt").write_text("payload", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        create_archive(
+            [str(src)],
+            str(dest),
+            "enc",
+            None,
+            "s3cret",
+            compression_level=1,
+        )
+        archive = dest / "enc.7z"
+        with pytest.raises(_PASSWORD_FAILURES):
+            _extract_archive(archive, tmp_path / "fail")
+        extracted = tmp_path / "ok"
+        _extract_archive(archive, extracted, password="s3cret")
+        assert (extracted / "src" / "secret.txt").read_text(encoding="utf-8") == "payload"
+
+    def test_store_is_larger_than_max_compression(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "data.bin").write_bytes(b"ABCDEFGH" * 8000)
+        dest0 = tmp_path / "d0"
+        dest9 = tmp_path / "d9"
+        dest0.mkdir()
+        dest9.mkdir()
+        create_archive([str(src)], str(dest0), "a0", None, None, compression_level=0)
+        create_archive([str(src)], str(dest9), "a9", None, None, compression_level=9)
+        size0 = (dest0 / "a0.7z").stat().st_size
+        size9 = (dest9 / "a9.7z").stat().st_size
+        assert size0 > size9
+        extracted = tmp_path / "out0"
+        _extract_archive(dest0 / "a0.7z", extracted)
+        assert (extracted / "src" / "data.bin").read_bytes() == b"ABCDEFGH" * 8000
+
+
+class TestExternalSevenZipFallback:
+    def test_successful_external_skips_py7zr(self, tmp_path: Path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        called = {"external": False, "py7zr": False}
+
+        def fake_sz(options, archive_path, sources, split_size=None, password=None, level=None, excluded=None):
+            called["external"] = True
+            Path(archive_path).write_bytes(b"fake-7z")
+
+        def boom(*args, **kwargs):
+            called["py7zr"] = True
+            raise AssertionError("built-in engine should not run")
+
+        monkeypatch.setattr("backup.sevenzip_create_archive", fake_sz)
+        monkeypatch.setattr("backup._create_with_py7zr", boom)
+        from sevenzip import SevenZipOptions
+
+        volumes = create_archive(
+            [str(src)],
+            str(dest),
+            "ext",
+            None,
+            None,
+            sevenzip=SevenZipOptions(path="7z"),
+        )
+        assert called["external"] is True
+        assert called["py7zr"] is False
+        assert volumes == ["ext.7z"]
+
+    def test_sevenzip_error_falls_back_to_py7zr(self, tmp_path: Path, monkeypatch, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("hello", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        def fake_sz(options, archive_path, sources, split_size=None, password=None, level=None, excluded=None):
+            Path(archive_path).write_bytes(b"partial-garbage")
+            from sevenzip import SevenZipError
+            raise SevenZipError("simulated failure")
+
+        monkeypatch.setattr("backup.sevenzip_create_archive", fake_sz)
+        from sevenzip import SevenZipOptions
+
+        create_archive(
+            [str(src)],
+            str(dest),
+            "fb",
+            None,
+            None,
+            sevenzip=SevenZipOptions(path="7z"),
+        )
+        assert "Falling back to built-in py7zr" in capsys.readouterr().err
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "fb.7z", extracted)
+        assert (extracted / "src" / "f.txt").read_text(encoding="utf-8") == "hello"
+
+    def test_duplicate_source_roots_skip_external(self, tmp_path: Path, monkeypatch, capsys):
+        src1 = tmp_path / "a" / "folder"
+        src2 = tmp_path / "b" / "folder"
+        src1.mkdir(parents=True)
+        src2.mkdir(parents=True)
+        (src1 / "a.txt").write_text("one", encoding="utf-8")
+        (src2 / "b.txt").write_text("two", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        called = {"external": False}
+
+        def fake_sz(*args, **kwargs):
+            called["external"] = True
+            raise AssertionError("external 7z should be skipped")
+
+        monkeypatch.setattr("backup.sevenzip_create_archive", fake_sz)
+        from sevenzip import SevenZipOptions
+
+        create_archive(
+            [str(src1), str(src2)],
+            str(dest),
+            "dup",
+            None,
+            None,
+            sevenzip=SevenZipOptions(path="7z"),
+        )
+        assert called["external"] is False
+        assert "duplicate source root name" in capsys.readouterr().err
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "dup.7z", extracted)
+        assert (extracted / "folder" / "a.txt").read_text(encoding="utf-8") == "one"
+        assert (extracted / "folder_1" / "b.txt").read_text(encoding="utf-8") == "two"
+
+
+class TestWalkErrorsAndJunctions:
+    def test_unreadable_directory_fails_backup(self, tmp_path: Path, capsys):
+        from unittest.mock import patch
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("data", encoding="utf-8")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        def denied(path):
+            raise PermissionError(13, "Access is denied", str(path))
+
+        with (
+            patch("backup.os.scandir", side_effect=denied),
+            pytest.raises(PermissionError),
+        ):
+            run_backup([str(src)], str(dest), "arc")
+
+        assert not (dest / "arc.7z").exists()
+        assert "Could not list directory" in capsys.readouterr().err
+
+    def test_windows_junction_is_not_walked(self, tmp_path: Path, capsys, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        dest_like = tmp_path / "cloud_dest"
+        dest_like.mkdir()
+        (dest_like / "old_backup.7z").write_bytes(b"should-not-be-archived")
+        junction = src / "to_dest"
+        junction.mkdir()
+        (junction / "leaked.txt").write_text("leaked", encoding="utf-8")
+
+        monkeypatch.setattr(
+            "backup._is_windows_junction",
+            lambda path: Path(path).resolve() == junction.resolve(),
+        )
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        run_backup([str(src)], str(dest), "arc")
+
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "arc.7z", extracted)
+        files = _file_map(extracted)
+        assert files["src/keep.txt"] == b"keep"
+        assert "src/to_dest/leaked.txt" not in files
+        assert "src/to_dest/old_backup.7z" not in files
+        assert not any("old_backup" in name for name in files)
+        assert "Skipping Windows junction" in capsys.readouterr().err
+
+    def test_windows_junction_recorded_in_excluded_out(self, tmp_path: Path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        junction = src / "to_dest"
+        junction.mkdir()
+        (junction / "leaked.txt").write_text("leaked", encoding="utf-8")
+
+        monkeypatch.setattr(
+            "backup._is_windows_junction",
+            lambda path: Path(path).resolve() == junction.resolve(),
+        )
+
+        excluded: list[str] = []
+        paths = get_all_paths([str(src)], excluded_out=excluded)
+        rels = {rel.replace("\\", "/") for _abs, rel, _kind in paths}
+        excluded_norm = {e.replace("\\", "/") for e in excluded}
+        assert "src/keep.txt" in rels
+        assert "src/to_dest" not in rels
+        assert "src/to_dest/leaked.txt" not in rels
+        assert "src/to_dest" in excluded_norm
+
+    def test_create_archive_sevenzip_does_not_archive_junction_targets(
+        self, tmp_path: Path, monkeypatch
+    ):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        dest_like = tmp_path / "cloud_dest"
+        dest_like.mkdir()
+        (dest_like / "old_backup.7z").write_bytes(b"should-not-be-archived")
+        junction = src / "to_dest"
+        junction.mkdir()
+        (junction / "leaked.txt").write_text("leaked", encoding="utf-8")
+
+        monkeypatch.setattr(
+            "backup._is_windows_junction",
+            lambda path: Path(path).resolve() == junction.resolve(),
+        )
+
+        def fake_sz(
+            options,
+            archive_path,
+            sources,
+            split_size=None,
+            password=None,
+            level=None,
+            excluded=None,
+        ):
+            # Walk like external 7z: follow directory junctions unless -xr@ applies.
+            excluded_norm = {e.replace("\\", "/").rstrip("/") for e in (excluded or [])}
+
+            def is_excluded(rel: str) -> bool:
+                rel = rel.replace("\\", "/")
+                return any(rel == ex or rel.startswith(ex + "/") for ex in excluded_norm)
+
+            with py7zr.SevenZipFile(archive_path, "w") as archive:
+                for src_item in sources:
+                    src_path = Path(src_item).resolve()
+                    root_name = src_path.name
+                    if src_path.is_file():
+                        if not is_excluded(root_name):
+                            archive.write(str(src_path), root_name)
+                        continue
+                    if not is_excluded(root_name):
+                        archive.write(str(src_path), root_name)
+                    for root, dirs, files in os.walk(src_path):
+                        for d in list(dirs):
+                            d_path = Path(root) / d
+                            rel = f"{root_name}/{d_path.relative_to(src_path).as_posix()}"
+                            if is_excluded(rel):
+                                dirs.remove(d)
+                                continue
+                            archive.write(str(d_path), rel)
+                        for f in files:
+                            f_path = Path(root) / f
+                            rel = f"{root_name}/{f_path.relative_to(src_path).as_posix()}"
+                            if not is_excluded(rel):
+                                archive.write(str(f_path), rel)
+
+        monkeypatch.setattr("backup.sevenzip_create_archive", fake_sz)
+        from sevenzip import SevenZipOptions
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        create_archive(
+            [str(src)],
+            str(dest),
+            "arc",
+            None,
+            None,
+            sevenzip=SevenZipOptions(path="7z"),
+        )
+
+        extracted = tmp_path / "out"
+        _extract_archive(dest / "arc.7z", extracted)
+        files = _file_map(extracted)
+        assert files["src/keep.txt"] == b"keep"
+        assert "src/to_dest/leaked.txt" not in files
+        assert not any("old_backup" in name for name in files)
+        assert not any("leaked.txt" in name for name in files)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows junctions only")
+    def test_real_windows_junction_not_archived(self, tmp_path: Path, capsys):
+        import subprocess
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "keep.txt").write_text("keep", encoding="utf-8")
+        dest_like = tmp_path / "cloud_dest"
+        dest_like.mkdir()
+        (dest_like / "old_backup.7z").write_bytes(b"should-not-be-archived")
+        junction = src / "to_dest"
+
+        try:
+            subprocess.check_call(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(dest_like)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            pytest.skip("Could not create a directory junction")
+
+        excluded: list[str] = []
+        paths = get_all_paths([str(src)], excluded_out=excluded)
+        rels = {rel.replace("\\", "/") for _abs, rel, _kind in paths}
+        excluded_norm = {e.replace("\\", "/") for e in excluded}
+        assert "src/keep.txt" in rels
+        assert not any("to_dest" in r for r in rels)
+        assert not any("old_backup" in r for r in rels)
+        assert "src/to_dest" in excluded_norm
+        assert "Skipping Windows junction" in capsys.readouterr().err
 
 

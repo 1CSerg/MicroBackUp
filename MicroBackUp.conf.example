@@ -1,12 +1,19 @@
 # Пример конфигурации MicroBackUp
 # Запуск: python main.py -c MicroBackUp.conf
 #
-# Секция [GLOBAL] задаёт значения по умолчанию для split, password, логирования и проверки хешей.
+# Не используйте [DEFAULT] — это не глобальные настройки (секция игнорируется).
+# Секция [GLOBAL] задаёт значения по умолчанию для split, password, exclude,
+# compression_level, sevenzip_path, sevenzip_args, логирования и проверки хешей.
 # Остальные секции — отдельные задания резервного копирования.
 # В секции задания обязательны sources, dest и name.
-# split, password и check_content_hash в секции перекрывают глобальные.
+# split, password, check_content_hash, compression_level, sevenzip_path и
+# sevenzip_args в секции перекрывают глобальные.
+# exclude в секции дописывается после глобального (можно отменить глобальное правило через !паттерн).
 # Пути с пробелами в sources нужно заключать в кавычки.
 # Кавычки вокруг dest необязательны и снимаются автоматически.
+#
+# Пароль: CLI -p > password в секции > env MICROBACKUP_PASSWORD > [GLOBAL] password.
+# Явный пустой password = в секции отключает пароль для этого задания.
 #
 # Логирование (только [GLOBAL]):
 # log_file         — путь к файлу лога; пустое значение или отсутствие ключа = не писать в файл
@@ -15,9 +22,23 @@
 # log_backup_count — число старых копий лога (по умолчанию 3)
 #
 # Опции производительности:
-# check_content_hash — (True/False, по умолчанию False) если True, утилита будет читать содержимое всех файлов 
-#                      для вычисления их хеша. Если False, проверяются только метаданные (размер и время изменения), 
+# check_content_hash — (True/False, по умолчанию False) если True, утилита будет читать содержимое всех файлов
+#                      для вычисления их хеша. Если False, проверяются только метаданные (размер и время изменения),
 #                      что работает в тысячи раз быстрее.
+#
+# Степень сжатия (оба движка):
+# compression_level — целое 0-9; 0 = без сжатия, 9 = максимум. Если не задан, каждый движок использует свой дефолт.
+#                     Смена уровня сама по себе не пересобирает уже существующий архив.
+#
+# Внешний 7-Zip (быстрее встроенной библиотеки; при ошибке — откат на py7zr):
+# sevenzip_path — путь к 7z.exe / 7z. Пример Windows: C:\Program Files\7-Zip\7z.exe
+#                 Пример Linux: /usr/bin/7z. Пусто / none / off в секции отключает внешний 7z для неё.
+# sevenzip_args — дополнительные ключи только для внешнего 7z, например -mmt=4
+#
+# Исключение путей (gitignore-синтаксис, относительно корня каждого источника):
+# exclude — один паттерн на строку; продолжения строк с отступом.
+#           * ? ** [abc]  — маски; / в конце — только каталог; / в начале — только корень источника;
+#           !паттерн      — вернуть ранее исключённый путь (не работает внутри уже исключённого каталога).
 
 [GLOBAL]
 split = 100m
@@ -26,11 +47,22 @@ log_file = MicroBackUp.log
 log_level = INFO
 log_max_size = 5m
 log_backup_count = 3
+compression_level = 5
+# sevenzip_path = C:\Program Files\7-Zip\7z.exe
+# sevenzip_args = -mmt=on
+exclude =
+    *.tmp
+    ~$*
 
 [ProjectA]
 sources = "D:\Work\Project A" C:\Logs
 dest = D:\Backups\ProjectA
 name = proj_a_backup
+exclude =
+    node_modules/
+    build/
+    *.log
+    !important.log
 
 [ProjectB]
 sources = D:\Work\ProjectB
@@ -38,3 +70,4 @@ dest = D:\Backups\ProjectB
 name = proj_b_backup
 split = 500m
 password = specific_secret
+compression_level = 9

@@ -6,17 +6,25 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import py7zr
 import pytest
 
 from main import (
     ConfigError,
+    __version__,
+    _program_dir,
+    _source_containing_dest,
     _unquote_path,
     execute_backup,
     logger,
     main,
+    parse_compression_level,
+    parse_exclude_patterns,
     parse_log_backup_count,
     parse_log_level,
     parse_optional_size,
+    parse_sevenzip_args,
+    parse_sevenzip_path,
     parse_size,
     parse_sources,
     run_from_config,
@@ -70,6 +78,11 @@ class TestParseSize:
         with pytest.raises(argparse.ArgumentTypeError, match="rounds to 0 bytes"):
             parse_size("0.000001k")
 
+    def test_non_finite_size_raises(self):
+        for raw in ("inf", "+inf", "-inf", "nan", "NaN", "infinity"):
+            with pytest.raises(argparse.ArgumentTypeError, match="strictly positive"):
+                parse_size(raw)
+
 
 class TestParseSources:
     def test_simple_paths(self):
@@ -85,6 +98,20 @@ class TestParseSources:
 
     def test_empty_string(self):
         assert parse_sources("") == []
+
+
+class TestParseExcludePatterns:
+    def test_empty_and_none(self):
+        assert parse_exclude_patterns(None) == []
+        assert parse_exclude_patterns("") == []
+        assert parse_exclude_patterns("   \n  \n") == []
+
+    def test_multiline_indented_patterns(self):
+        raw = "\n*.tmp\n~$*\n    node_modules/\n"
+        assert parse_exclude_patterns(raw) == ["*.tmp", "~$*", "node_modules/"]
+
+    def test_strips_each_line(self):
+        assert parse_exclude_patterns("  *.log  \n  !keep.log ") == ["*.log", "!keep.log"]
 
 
 class TestUnquotePath:
@@ -119,6 +146,61 @@ class TestParseOptionalSize:
     def test_invalid_size_raises_config_error(self):
         with pytest.raises(ConfigError, match=r"\[GLOBAL\] split: Invalid size format"):
             parse_optional_size("nope", "[GLOBAL] split")
+
+
+class TestParseCompressionLevel:
+    def test_empty_and_none_return_none(self):
+        assert parse_compression_level(None, "ctx") is None
+        assert parse_compression_level("", "ctx") is None
+        assert parse_compression_level("  ", "ctx") is None
+        assert parse_compression_level("none", "ctx") is None
+        assert parse_compression_level("OFF", "ctx") is None
+
+    def test_valid_range(self):
+        assert parse_compression_level("0", "ctx") == 0
+        assert parse_compression_level("5", "ctx") == 5
+        assert parse_compression_level("9", "ctx") == 9
+
+    def test_out_of_range_raises(self):
+        with pytest.raises(ConfigError, match="integer 0-9"):
+            parse_compression_level("10", "[GLOBAL] compression_level")
+        with pytest.raises(ConfigError, match="integer 0-9"):
+            parse_compression_level("-1", "ctx")
+
+    def test_non_integer_raises(self):
+        with pytest.raises(ConfigError, match="integer 0-9"):
+            parse_compression_level("fast", "ctx")
+
+
+class TestParseSevenZip:
+    def test_args_empty(self):
+        assert parse_sevenzip_args(None, "ctx") == ()
+        assert parse_sevenzip_args("", "ctx") == ()
+        assert parse_sevenzip_args("  ", "ctx") == ()
+
+    def test_args_split(self):
+        assert parse_sevenzip_args("-mmt=4", "ctx") == ("-mmt=4",)
+        parsed = parse_sevenzip_args("-mmt=4 -ms=off", "ctx")
+        assert "-mmt=4" in parsed
+        assert "-ms=off" in parsed
+
+    def test_path_none_and_off(self):
+        assert parse_sevenzip_path(None, "ctx") is None
+        assert parse_sevenzip_path("", "ctx") is None
+        assert parse_sevenzip_path("none", "ctx") is None
+        assert parse_sevenzip_path("OFF", "ctx") is None
+
+    def test_path_unquotes(self):
+        assert parse_sevenzip_path(r'"C:\Program Files\7-Zip\7z.exe"', "ctx") == r"C:\Program Files\7-Zip\7z.exe"
+
+    def test_args_unclosed_quote_raises(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise ValueError("No closing quotation")
+
+        monkeypatch.setattr("main.shlex.split", boom)
+        with pytest.raises(ConfigError, match="sevenzip_args"):
+            parse_sevenzip_args('"-mmt', "ctx")
+
 
 
 class TestValidateArchiveName:
@@ -242,6 +324,48 @@ class TestExecuteBackup:
         ok = execute_backup([str(src)], str(dest_file), "arc", None, None)
         assert ok is False
         assert "Destination path is an existing file, not a directory" in capsys.readouterr().err
+
+    def test_generic_exception_returns_false(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        with patch("main.run_backup", side_effect=Exception("py7zr archive exploded")):
+            ok = execute_backup([str(src)], str(dest), "arc", None, None)
+
+        assert ok is False
+        assert "Backup failed: py7zr archive exploded" in capsys.readouterr().err
+
+    def test_dest_inside_source_returns_false(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+        dest = src / "backups"
+
+        ok = execute_backup([str(src)], str(dest), "arc", None, None)
+
+        assert ok is False
+        assert "inside a source path" in capsys.readouterr().err
+        assert not dest.exists()
+
+    def test_dest_equals_source_returns_false(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("data", encoding="utf-8")
+
+        ok = execute_backup([str(src)], str(src), "arc", None, None)
+
+        assert ok is False
+        assert "inside a source path" in capsys.readouterr().err
+        assert not (src / "arc.7z").exists()
+
+    def test_source_containing_dest_sibling_is_ok(self, tmp_path):
+        src = tmp_path / "src"
+        dest = tmp_path / "dest"
+        src.mkdir()
+        dest.mkdir()
+        assert _source_containing_dest(str(dest), [str(src)]) is None
 
 
 class TestRunFromConfig:
@@ -384,7 +508,7 @@ password = specific_secret
 
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(
                 {
                     "sources": sources,
@@ -416,6 +540,62 @@ password = specific_secret
         assert job_b["split_size"] == 500 * 1024 * 1024
         assert job_b["password"] == "specific_secret"
         assert job_b["check_content_hash"] is False
+
+    def test_ini_default_section_does_not_inherit_password(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MICROBACKUP_PASSWORD", raising=False)
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "default.conf",
+            f"[DEFAULT]\npassword = from_default\n\n[Job]\nsources = {src}\ndest = {dest}\nname = n\n",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append(password)
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+
+        assert ok is True
+        assert captured == [None]
+
+    def test_only_default_section_is_not_a_job(self, tmp_path, capsys):
+        conf = self._write_conf(
+            tmp_path / "only_default.conf",
+            "[DEFAULT]\npassword = from_default\n\n[GLOBAL]\nsplit = 10m\n",
+        )
+        ok = run_from_config(str(conf))
+        err = capsys.readouterr().err
+        assert ok is False
+        assert "Ignoring [DEFAULT]" in err
+        assert "No backup sections found" in err
+
+    def test_utf8_bom_preserves_global_section(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        body = (
+            f"[GLOBAL]\npassword = from_global\n\n"
+            f"[Job]\nsources = {src}\ndest = {dest}\nname = bom\n"
+        )
+        conf = tmp_path / "bom.conf"
+        conf.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append(password)
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            ok = run_from_config(str(conf))
+
+        assert ok is True
+        assert captured == ["from_global"]
 
     def test_quoted_dest_with_spaces_is_unquoted(self, tmp_path):
         src = tmp_path / "src"
@@ -459,7 +639,7 @@ check_content_hash = false
 
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(check_content_hash)
             return True
 
@@ -494,6 +674,40 @@ name = bad
         assert (dest / "good.7z").is_file()
         assert "Source path does not exist" in capsys.readouterr().err
 
+    def test_unexpected_exception_does_not_abort_other_jobs(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest_bad = tmp_path / "dest_bad"
+        dest_ok = tmp_path / "dest_ok"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[Bad]
+sources = {src}
+dest = {dest_bad}
+name = bad
+
+[Good]
+sources = {src}
+dest = {dest_ok}
+name = good
+""",
+        )
+        names: list[str] = []
+
+        def fake_run(*args, **kwargs):
+            name = kwargs.get("archive_name", args[2] if len(args) > 2 else None)
+            names.append(name)
+            if name == "bad":
+                raise Exception("archive exploded")
+
+        with patch("main.run_backup", side_effect=fake_run):
+            ok = run_from_config(str(conf))
+
+        assert ok is False
+        assert names == ["bad", "good"]
+        assert "archive exploded" in capsys.readouterr().err
+
     def test_empty_section_password_clears_global(self, tmp_path):
         src = tmp_path / "src"
         src.mkdir()
@@ -515,7 +729,7 @@ password =
 
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(password)
             return True
 
@@ -546,7 +760,7 @@ check_content_hash = false
 
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(check_content_hash)
             return True
 
@@ -589,7 +803,7 @@ split = off
         )
         splits = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             splits.append((archive_name, split_size))
             return True
 
@@ -628,7 +842,7 @@ name = arc2
         )
         splits = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             splits.append((archive_name, split_size))
             return True
 
@@ -653,7 +867,7 @@ class TestResolvePassword:
         monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(password)
             return True
 
@@ -679,7 +893,7 @@ class TestResolvePassword:
         monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(password)
             return True
 
@@ -700,7 +914,7 @@ class TestResolvePassword:
         monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(password)
             return True
 
@@ -721,7 +935,7 @@ class TestResolvePassword:
         monkeypatch.setenv("MICROBACKUP_PASSWORD", "env_secret")
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(password)
             return True
 
@@ -742,7 +956,7 @@ class TestResolvePassword:
         monkeypatch.delenv("MICROBACKUP_PASSWORD", raising=False)
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(password)
             return True
 
@@ -762,7 +976,7 @@ class TestResolvePassword:
     def test_cli_password_overrides_config_job(self, tmp_path):
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(password)
             return True
 
@@ -782,10 +996,19 @@ class TestResolvePassword:
 
 
 class TestMainCli:
-    def test_missing_required_args(self, monkeypatch):
+    def test_missing_required_args_creates_default_config(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv", ["main.py"])
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             main()
+        assert exc.value.code == 0
+        conf = tmp_path / "MicroBackUp.conf"
+        assert conf.is_file()
+        captured = capsys.readouterr()
+        assert "Created default config file" in captured.out
+        import configparser
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string(conf.read_text(encoding="utf-8"))
+        assert parser.sections() == []
 
     def test_version_flag_prints_version_and_exits(self, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv", ["main.py", "-v"])
@@ -794,7 +1017,7 @@ class TestMainCli:
         assert exc.value.code == 0
         out = capsys.readouterr().out
         assert "MicroBackUp" in out
-        assert "1.0.0" in out
+        assert __version__ in out
 
     def test_missing_config_file(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv", ["main.py", "-c", str(tmp_path / "no.conf")])
@@ -830,7 +1053,7 @@ class TestMainCli:
         )
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(password)
             return True
 
@@ -1032,7 +1255,7 @@ class TestMainCli:
         )
         captured = []
 
-        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False):
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
             captured.append(split_size)
             return True
 
@@ -1182,6 +1405,28 @@ name = logged
         assert "Section [Job]" in text
         assert "INFO" in text
 
+    def test_quoted_log_file_in_config(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("ok", encoding="utf-8")
+        dest = tmp_path / "dest"
+        log_file = tmp_path / "quoted.log"
+        conf = tmp_path / "jobs.conf"
+        conf.write_text(
+            f'''[GLOBAL]
+log_file = "{log_file}"
+
+[Job]
+sources = {src}
+dest = {dest}
+name = logged
+''',
+            encoding="utf-8",
+        )
+        assert run_from_config(str(conf)) is True
+        assert log_file.is_file()
+        assert "Section [Job]" in log_file.read_text(encoding="utf-8")
+
     def test_invalid_log_max_size_in_config(self, tmp_path, capsys):
         conf = tmp_path / "bad_size.conf"
         conf.write_text(
@@ -1257,3 +1502,417 @@ name = logged
         assert "bg info message" in content
         assert "bg warning message" in content
         assert "bg error message" in content
+
+
+class TestExcludeConfig:
+    def _write_conf(self, path: Path, text: str) -> Path:
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_section_exclude_only(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[Job]
+sources = {src}
+dest = {dest}
+name = job
+exclude =
+    *.log
+    node_modules/
+""",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append(exclude)
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            assert run_from_config(str(conf)) is True
+        assert captured == [["*.log", "node_modules/"]]
+
+    def test_global_exclude_only(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[GLOBAL]
+exclude =
+    *.tmp
+    ~$*
+
+[Job]
+sources = {src}
+dest = {dest}
+name = job
+""",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append(exclude)
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            assert run_from_config(str(conf)) is True
+        assert captured == [["*.tmp", "~$*"]]
+
+    def test_global_and_section_are_merged(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[GLOBAL]
+exclude =
+    *.tmp
+
+[Job]
+sources = {src}
+dest = {dest}
+name = job
+exclude =
+    *.log
+    !keep.log
+""",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append(exclude)
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            assert run_from_config(str(conf)) is True
+        assert captured == [["*.tmp", "*.log", "!keep.log"]]
+
+    def test_section_negation_overrides_global(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "keep.tmp").write_text("keep", encoding="utf-8")
+        (src / "drop.tmp").write_text("drop", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[GLOBAL]
+exclude =
+    *.tmp
+
+[Job]
+sources = {src}
+dest = {dest}
+name = job
+exclude =
+    !keep.tmp
+""",
+        )
+        assert run_from_config(str(conf)) is True
+        extracted = tmp_path / "out"
+        with py7zr.SevenZipFile(dest / "job.7z", "r") as archive:
+            archive.extractall(path=extracted)
+        assert (extracted / "src" / "keep.tmp").read_text(encoding="utf-8") == "keep"
+        assert not (extracted / "src" / "drop.tmp").exists()
+
+    def test_invalid_pattern_skips_section_and_continues(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        dest_bad = tmp_path / "dest_bad"
+        dest_ok = tmp_path / "dest_ok"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[Bad]
+sources = {src}
+dest = {dest_bad}
+name = bad
+exclude = !
+
+[Good]
+sources = {src}
+dest = {dest_ok}
+name = good
+""",
+        )
+        ok = run_from_config(str(conf))
+        captured = capsys.readouterr()
+        assert ok is False
+        assert "[Bad] exclude:" in captured.err
+        assert "Invalid exclude pattern" in captured.err
+        assert (dest_ok / "good.7z").is_file()
+        assert not (dest_bad / "bad.7z").exists()
+
+    def test_missing_exclude_backs_up_all_files(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A", encoding="utf-8")
+        (src / "b.log").write_text("B", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[Job]
+sources = {src}
+dest = {dest}
+name = job
+""",
+        )
+        assert run_from_config(str(conf)) is True
+        extracted = tmp_path / "out"
+        with py7zr.SevenZipFile(dest / "job.7z", "r") as archive:
+            archive.extractall(path=extracted)
+        assert (extracted / "src" / "a.txt").read_text(encoding="utf-8") == "A"
+        assert (extracted / "src" / "b.log").read_text(encoding="utf-8") == "B"
+
+
+class TestProgramDir:
+    def test_source_layout(self, tmp_path):
+        source = tmp_path / "pkg" / "main.py"
+        source.parent.mkdir()
+        source.write_text("#", encoding="utf-8")
+        assert _program_dir(False, str(tmp_path / "python.exe"), str(source)) == source.parent.resolve()
+
+    def test_frozen_layout(self, tmp_path):
+        exe = tmp_path / "dist" / "MicroBackUp.exe"
+        exe.parent.mkdir()
+        exe.write_bytes(b"")
+        assert _program_dir(True, str(exe), str(tmp_path / "unused.py")) == exe.parent.resolve()
+
+
+class TestAutoConfig:
+    def test_existing_default_config_is_used(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = tmp_path / "MicroBackUp.conf"
+        conf.write_text(
+            f"[Job]\nsources = {src}\ndest = {dest}\nname = auto_arc\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sys, "argv", ["main.py"])
+        main()
+        assert (dest / "auto_arc.7z").is_file()
+
+    def test_cli_sources_skip_autoconfig(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["main.py", "-s", str(src), "-d", str(dest), "-n", "cli_arc"],
+        )
+        main()
+        assert (dest / "cli_arc.7z").is_file()
+        assert not (tmp_path / "MicroBackUp.conf").exists()
+
+    def test_explicit_config_skips_autoconfig(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        other = tmp_path / "other.conf"
+        other.write_text(
+            f"[Job]\nsources = {src}\ndest = {dest}\nname = from_c\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sys, "argv", ["main.py", "-c", str(other)])
+        main()
+        assert (dest / "from_c.7z").is_file()
+        assert not (tmp_path / "MicroBackUp.conf").exists()
+
+    def test_create_config_oserror_exits_1(self, tmp_path, monkeypatch, capsys):
+        def boom(path):
+            raise OSError("denied")
+
+        monkeypatch.setattr("main.write_default_config", boom)
+        monkeypatch.setattr(sys, "argv", ["main.py"])
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+        assert "Could not create config file" in capsys.readouterr().err
+
+
+class TestCompressionAndSevenZipConfig:
+    def _write_conf(self, path: Path, text: str) -> Path:
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_global_and_section_priority(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest_a = tmp_path / "a"
+        dest_b = tmp_path / "b"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[GLOBAL]
+compression_level = 5
+sevenzip_path = C:\\\\global\\\\7z.exe
+sevenzip_args = -mmt=2
+
+[JobA]
+sources = {src}
+dest = {dest_a}
+name = a
+
+[JobB]
+sources = {src}
+dest = {dest_b}
+name = b
+compression_level = 9
+sevenzip_path = none
+sevenzip_args = -mmt=8
+""",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append(
+                {
+                    "name": archive_name,
+                    "compression_level": compression_level,
+                    "sevenzip": sevenzip,
+                }
+            )
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            assert run_from_config(str(conf)) is True
+
+        job_a = captured[0]
+        job_b = captured[1]
+        assert job_a["compression_level"] == 5
+        assert job_a["sevenzip"] is not None
+        assert job_a["sevenzip"].path.endswith("7z.exe")
+        assert job_a["sevenzip"].extra_args == ("-mmt=2",)
+        assert job_b["compression_level"] == 9
+        assert job_b["sevenzip"] is None
+
+    def test_empty_section_level_clears_global(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[GLOBAL]
+compression_level = 7
+
+[Job]
+sources = {src}
+dest = {dest}
+name = n
+compression_level =
+""",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append(compression_level)
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            assert run_from_config(str(conf)) is True
+        assert captured == [None]
+
+    def test_invalid_compression_level_returns_false(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "bad.conf",
+            f"[GLOBAL]\ncompression_level = 99\n\n[Job]\nsources = {src}\ndest = {dest}\nname = n\n",
+        )
+        assert run_from_config(str(conf)) is False
+        assert "compression_level" in capsys.readouterr().err
+
+    def test_invalid_job_compression_level_skips(self, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "bad.conf",
+            f"[Job]\nsources = {src}\ndest = {dest}\nname = n\ncompression_level = abc\n",
+        )
+        ok = run_from_config(str(conf))
+        assert ok is False
+        assert "compression_level" in capsys.readouterr().err
+
+    def test_cli_overrides_config(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        conf = self._write_conf(
+            tmp_path / "jobs.conf",
+            f"""[GLOBAL]
+compression_level = 1
+sevenzip_path = C:\\\\cfg\\\\7z.exe
+sevenzip_args = -mmt=1
+
+[Job]
+sources = {src}
+dest = {dest}
+name = n
+""",
+        )
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append((compression_level, sevenzip))
+            return True
+
+        with patch("main.execute_backup", side_effect=fake_execute):
+            assert run_from_config(
+                str(conf),
+                cli_compression_level=9,
+                cli_sevenzip_path=r"D:\cli\7z.exe",
+                cli_sevenzip_args=("-mmt=4",),
+            ) is True
+        level, options = captured[0]
+        assert level == 9
+        assert options.path == r"D:\cli\7z.exe"
+        assert options.extra_args == ("-mmt=4",)
+
+    def test_cli_mode_passes_compression_level(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        captured = []
+
+        def fake_execute(sources, dest, archive_name, split_size, password, check_content_hash=False, exclude=None, sevenzip=None, compression_level=None):
+            captured.append(compression_level)
+            return True
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["main.py", "-s", str(src), "-d", str(dest), "-n", "n", "--compression-level", "0"],
+        )
+        with patch("main.execute_backup", side_effect=fake_execute):
+            main()
+        assert captured == [0]
+
+    def test_cli_invalid_compression_level_exits(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        dest = tmp_path / "dest"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["main.py", "-s", str(src), "-d", str(dest), "-n", "n", "--compression-level", "99"],
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+        assert "compression_level" in capsys.readouterr().err

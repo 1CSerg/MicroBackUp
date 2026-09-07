@@ -13,6 +13,12 @@ def _reset_logging():
     setup_logging()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_program_dir(tmp_path, monkeypatch):
+    """Keep auto-created MicroBackUp.conf out of the repository directory."""
+    monkeypatch.setattr("main.program_dir", lambda: tmp_path)
+
+
 @pytest.fixture
 def source_tree(tmp_path: Path) -> Path:
     """Create a small nested source tree used by backup tests."""

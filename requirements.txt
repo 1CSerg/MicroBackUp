@@ -1,2 +1,3 @@
 py7zr==1.1.3
 multivolumefile==0.2.3
+pathspec==1.1.1

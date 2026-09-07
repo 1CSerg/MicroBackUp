@@ -3,17 +3,30 @@ from __future__ import annotations
 import argparse
 import configparser
 import logging
+import math
 import os
 import re
+import shlex
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
+from config_template import DEFAULT_CONFIG_TEMPLATE
+from sevenzip import SevenZipOptions
+
 try:
-    from backup import _validate_archive_name, run_backup
+    from backup import (
+        ExcludeError,
+        _validate_archive_name,
+        build_exclude_spec,
+        run_backup,
+        source_containing_dest as _source_containing_dest,
+    )
 except ImportError as _exc:  # pragma: no cover - depends on runtime environment
     run_backup = None  # type: ignore[assignment]
+    build_exclude_spec = None  # type: ignore[assignment]
+    ExcludeError = ValueError  # type: ignore[misc, assignment]
     _IMPORT_ERROR = _exc
     _WINDOWS_RESERVED_NAMES = frozenset(
         {"CON", "PRN", "AUX", "NUL"}
@@ -34,10 +47,25 @@ except ImportError as _exc:  # pragma: no cover - depends on runtime environment
         if stem in _WINDOWS_RESERVED_NAMES:
             return f"Archive name is a reserved device name: {archive_name!r}"
         return None
+
+    def _source_containing_dest(dest: str, sources: list[str]) -> str | None:  # type: ignore[misc]
+        dest_path = Path(dest).resolve()
+        for src in sources:
+            src_path = Path(src).resolve()
+            if dest_path == src_path:
+                return src
+            if not src_path.is_dir():
+                continue
+            try:
+                dest_path.relative_to(src_path)
+            except ValueError:
+                continue
+            return src
+        return None
 else:
     _IMPORT_ERROR = None
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 GLOBAL_SECTION = "GLOBAL"
 LOGGER_NAME = "microbackup"
@@ -45,15 +73,50 @@ DEFAULT_LOG_LEVEL = logging.INFO
 DEFAULT_LOG_BACKUP_COUNT = 3
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 PASSWORD_ENV_VAR = "MICROBACKUP_PASSWORD"
+DEFAULT_CONFIG_NAME = "MicroBackUp.conf"
 
 # Sentinel for "value not provided" (distinct from None which means "explicitly empty").
 _UNSET = object()
 
 logger = logging.getLogger(LOGGER_NAME)
+_warned_sevenzip_password = False
 
 
 class ConfigError(ValueError):
     """Raised when a config value is invalid."""
+
+
+def program_dir() -> Path:
+    """Directory of the program: next to the exe when frozen, else next to main.py."""
+    return _program_dir(getattr(sys, "frozen", False), sys.executable, __file__)
+
+
+def _program_dir(frozen: bool, executable: str, source_file: str) -> Path:
+    if frozen:
+        return Path(executable).resolve().parent
+    return Path(source_file).resolve().parent
+
+
+def default_config_path() -> Path:
+    return program_dir() / DEFAULT_CONFIG_NAME
+
+
+def write_default_config(path: Path) -> None:
+    """Create a config from the commented template. Does not overwrite an existing file."""
+    newline = "\r\n" if os.name == "nt" else "\n"
+    with open(path, "x", encoding="utf-8", newline=newline) as f:
+        f.write(DEFAULT_CONFIG_TEMPLATE)
+
+
+def _warn_sevenzip_password() -> None:
+    global _warned_sevenzip_password
+    if _warned_sevenzip_password:
+        return
+    logger.warning(
+        "Password is passed to the external 7z process on the command line "
+        "and may be visible in the process list."
+    )
+    _warned_sevenzip_password = True
 
 
 class _MaxLevelFilter(logging.Filter):
@@ -169,12 +232,17 @@ def parse_size(size_str: str | None) -> int | None:
             f"Invalid size format: {size_str!r}. Use k, m, or g suffixes (e.g., 100m)."
         )
 
-    if numeric <= 0:
+    if not math.isfinite(numeric) or numeric <= 0:
         raise argparse.ArgumentTypeError(
             f"Size must be strictly positive, got {numeric!r}."
         )
 
-    value = int(numeric * multiplier)
+    try:
+        value = int(numeric * multiplier)
+    except (OverflowError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"Size {numeric!r} with suffix cannot be converted to bytes."
+        )
     if value <= 0:
         raise argparse.ArgumentTypeError(
             f"Size {numeric!r} with suffix rounds to 0 bytes; use a larger value."
@@ -188,6 +256,13 @@ def parse_sources(sources_str: str) -> list[str]:
         return []
     matches = re.findall(r'"([^"]+)"|\'([^\']+)\'|(\S+)', sources_str)
     return [m[0] or m[1] or m[2] for m in matches]
+
+
+def parse_exclude_patterns(raw: str | None) -> list[str]:
+    """One gitignore-style pattern per line; blank lines dropped."""
+    if not raw:
+        return []
+    return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
 def _unquote_path(value: str) -> str:
@@ -227,6 +302,51 @@ def parse_log_backup_count(value: Any, context: str) -> int:
         raise ConfigError(f"{context}: invalid log_backup_count '{value}'. Use a non-negative integer.")
 
 
+def parse_compression_level(value: Any, context: str) -> int | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.lower() in ("none", "off"):
+        return None
+    try:
+        level = int(raw)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{context}: invalid compression_level '{value}'. Use an integer 0-9.")
+    if not 0 <= level <= 9:
+        raise ConfigError(f"{context}: invalid compression_level '{value}'. Use an integer 0-9.")
+    return level
+
+
+def parse_sevenzip_args(value: Any, context: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    raw = str(value).strip()
+    if not raw:
+        return ()
+    try:
+        parts = shlex.split(raw, posix=(os.name != "nt"))
+    except ValueError as e:
+        raise ConfigError(f"{context}: invalid sevenzip_args: {e}") from e
+    return tuple(parts)
+
+
+def parse_sevenzip_path(value: Any, context: str) -> str | None:
+    if value is None:
+        return None
+    path = _unquote_path(str(value))
+    if not path or path.lower() in ("none", "off"):
+        return None
+    return path
+
+
+def _build_sevenzip_options(path: str | None, extra_args: tuple[str, ...]) -> SevenZipOptions | None:
+    if not path:
+        return None
+    return SevenZipOptions(path=path, extra_args=extra_args)
+
+
 def _get_boolean(parser: configparser.ConfigParser, section: str, option: str, context: str, fallback: bool = False) -> bool:
     """Read a boolean option, raising ConfigError on a malformed value."""
     if not parser.has_option(section, option):
@@ -260,7 +380,7 @@ def _resolve_password(
     return global_password
 
 
-def execute_backup(sources: list[str], dest: str, archive_name: str, split_size: int | None, password: str | None, check_content_hash: bool = False) -> bool:
+def execute_backup(sources: list[str], dest: str, archive_name: str, split_size: int | None, password: str | None, check_content_hash: bool = False, exclude: list[str] | None = None, sevenzip: SevenZipOptions | None = None, compression_level: int | None = None) -> bool:
     if run_backup is None:
         logger.error(
             f"Error: required dependency missing ({_IMPORT_ERROR}). "
@@ -288,6 +408,13 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
         logger.error(f"Error: Destination path is an existing file, not a directory: {dest}")
         return False
 
+    containing = _source_containing_dest(dest, sources)
+    if containing is not None:
+        logger.error(
+            f"Error: Destination path is inside a source path: {dest} is under {containing}"
+        )
+        return False
+
     if not os.path.exists(dest):
         try:
             os.makedirs(dest)
@@ -296,15 +423,20 @@ def execute_backup(sources: list[str], dest: str, archive_name: str, split_size:
             return False
 
     try:
+        if sevenzip is not None and password:
+            _warn_sevenzip_password()
         run_backup(
             sources=sources,
             dest=dest,
             archive_name=archive_name,
             split_size=split_size,
             password=password,
-            check_content_hash=check_content_hash
+            check_content_hash=check_content_hash,
+            exclude=exclude,
+            sevenzip=sevenzip,
+            compression_level=compression_level,
         )
-    except (OSError, RuntimeError, ValueError) as e:
+    except Exception as e:
         logger.error(f"Backup failed: {e}")
         return False
 
@@ -333,6 +465,8 @@ def _apply_logging_config(global_parser: configparser.ConfigParser, section: str
     log_file = overrides.get("log_file")
     if not log_file and section:
         log_file = global_parser.get(section, "log_file", fallback=None) or None
+    if log_file:
+        log_file = _unquote_path(str(log_file)) or None
 
     if overrides.get("log_level") is not None:
         log_level = overrides["log_level"]
@@ -378,10 +512,18 @@ def run_from_config(
     cli_check_content_hash: bool = False,
     cli_password: str | None = None,
     cli_split: int | None = None,
+    cli_compression_level: Any = _UNSET,
+    cli_sevenzip_path: Any = _UNSET,
+    cli_sevenzip_args: Any = _UNSET,
 ) -> bool:
-    parser = configparser.ConfigParser(interpolation=None)
+    # A dummy default_section disables INI [DEFAULT] inheritance, which would
+    # otherwise make has_option('Job', 'password') true for every job.
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        default_section="__microbackup_no_default__",
+    )
     try:
-        with open(config_path, encoding='utf-8') as f:
+        with open(config_path, encoding="utf-8-sig") as f:
             parser.read_file(f)
     except OSError as e:
         logger.error(f"Error: Could not read config file {config_path}: {e}")
@@ -394,10 +536,19 @@ def run_from_config(
     global_password = None
     global_section_name = None
     global_check_content_hash = False
+    global_exclude: list[str] = []
+    global_compression_level: int | None = None
+    global_sevenzip_path: str | None = None
+    global_sevenzip_args: tuple[str, ...] = ()
     job_sections = []
 
     try:
         for section in parser.sections():
+            if section.upper() == "DEFAULT":
+                logger.warning(
+                    "Ignoring [DEFAULT] section; use [GLOBAL] for shared defaults."
+                )
+                continue
             if section.upper() == GLOBAL_SECTION:
                 if global_section_name is not None:
                     raise ConfigError(
@@ -409,6 +560,19 @@ def run_from_config(
                 global_split = parse_optional_size(split_raw, f"[{section}] split")
                 global_password = parser.get(section, 'password', fallback=None) or None
                 global_check_content_hash = _get_boolean(parser, section, 'check_content_hash', f"[{section}] check_content_hash")
+                global_exclude = parse_exclude_patterns(parser.get(section, 'exclude', fallback=''))
+                global_compression_level = parse_compression_level(
+                    parser.get(section, 'compression_level', fallback=None),
+                    f"[{section}] compression_level",
+                )
+                global_sevenzip_path = parse_sevenzip_path(
+                    parser.get(section, 'sevenzip_path', fallback=None),
+                    f"[{section}] sevenzip_path",
+                )
+                global_sevenzip_args = parse_sevenzip_args(
+                    parser.get(section, 'sevenzip_args', fallback=None),
+                    f"[{section}] sevenzip_args",
+                )
             else:
                 job_sections.append(section)
     except ConfigError as e:
@@ -420,6 +584,8 @@ def run_from_config(
     except ConfigError as e:
         logger.error(f"Error: {e}")
         return False
+
+    logger.info(f"Using config file: {config_path}")
 
     if not job_sections:
         logger.error(f"Error: No backup sections found in {config_path}")
@@ -478,7 +644,63 @@ def run_from_config(
         else:
             check_content_hash = cli_check_content_hash or global_check_content_hash
 
-        if execute_backup(sources, dest, name, split_size, password, check_content_hash=check_content_hash):
+        exclude = global_exclude + parse_exclude_patterns(parser.get(section, 'exclude', fallback=''))
+        if exclude and build_exclude_spec is not None:
+            try:
+                build_exclude_spec(exclude)
+            except ExcludeError as e:
+                logger.error(f"Error: [{section}] exclude: {e}")
+                any_failed = True
+                continue
+
+        try:
+            if cli_compression_level is not _UNSET:
+                compression_level = cli_compression_level
+            elif parser.has_option(section, 'compression_level'):
+                compression_level = parse_compression_level(
+                    parser.get(section, 'compression_level'),
+                    f"[{section}] compression_level",
+                )
+            else:
+                compression_level = global_compression_level
+
+            if cli_sevenzip_path is not _UNSET:
+                sevenzip_path = cli_sevenzip_path
+            elif parser.has_option(section, 'sevenzip_path'):
+                sevenzip_path = parse_sevenzip_path(
+                    parser.get(section, 'sevenzip_path'),
+                    f"[{section}] sevenzip_path",
+                )
+            else:
+                sevenzip_path = global_sevenzip_path
+
+            if cli_sevenzip_args is not _UNSET:
+                sevenzip_args = cli_sevenzip_args
+            elif parser.has_option(section, 'sevenzip_args'):
+                sevenzip_args = parse_sevenzip_args(
+                    parser.get(section, 'sevenzip_args'),
+                    f"[{section}] sevenzip_args",
+                )
+            else:
+                sevenzip_args = global_sevenzip_args
+        except ConfigError as e:
+            logger.error(f"Error: {e}")
+            any_failed = True
+            continue
+
+        sevenzip = _build_sevenzip_options(sevenzip_path, sevenzip_args)
+
+        if execute_backup(
+            sources,
+            dest,
+            name,
+            split_size,
+            password,
+            check_content_hash=check_content_hash,
+            exclude=exclude,
+            sevenzip=sevenzip,
+            compression_level=compression_level,
+        ):
             any_ok = True
         else:
             any_failed = True
@@ -580,6 +802,21 @@ def main() -> None:
         help="Optional. Force checking full file content hashes instead of just metadata."
     )
 
+    parser.add_argument(
+        '--compression-level',
+        help="Optional. Compression level 0-9 (0 = store). Applies to both built-in py7zr and external 7z."
+    )
+
+    parser.add_argument(
+        '--sevenzip-path',
+        help="Optional. Path to the 7z/7z.exe binary. If omitted, the built-in engine is used."
+    )
+
+    parser.add_argument(
+        '--sevenzip-args',
+        help="Optional. Extra arguments passed to external 7z (e.g. -mmt=4)."
+    )
+
     args = parser.parse_args()
 
     # Скрываем окно консоли в Windows сразу, чтобы не мелькало
@@ -594,20 +831,57 @@ def main() -> None:
 
     try:
         log_overrides = _cli_log_overrides(args)
+        cli_compression_level: Any = _UNSET
+        cli_sevenzip_path: Any = _UNSET
+        cli_sevenzip_args: Any = _UNSET
+        if args.compression_level is not None:
+            cli_compression_level = parse_compression_level(args.compression_level, "--compression-level")
+        if args.sevenzip_path is not None:
+            cli_sevenzip_path = parse_sevenzip_path(args.sevenzip_path, "--sevenzip-path")
+        if args.sevenzip_args is not None:
+            cli_sevenzip_args = parse_sevenzip_args(args.sevenzip_args, "--sevenzip-args")
     except ConfigError as e:
         logger.error(f"Error: {e}")
         sys.exit(1)
 
-    if args.config:
-        if not os.path.exists(args.config):
-            logger.error(f"Error: Config file does not exist: {args.config}")
+    config_path = args.config
+    if not config_path and not (args.sources or args.dest or args.name):
+        candidate = default_config_path()
+        if candidate.is_file():
+            config_path = str(candidate)
+        else:
+            try:
+                setup_logging(
+                    log_file=log_overrides.get("log_file"),
+                    log_level=log_overrides.get("log_level"),
+                    log_max_size=log_overrides.get("log_max_size"),
+                    log_backup_count=log_overrides.get("log_backup_count"),
+                )
+            except ConfigError as e:
+                logger.error(f"Error: {e}")
+                sys.exit(1)
+            try:
+                write_default_config(candidate)
+            except OSError as e:
+                logger.error(f"Error: Could not create config file {candidate}: {e}")
+                sys.exit(1)
+            logger.info(f"Created default config file: {candidate}")
+            logger.info("Edit it (uncomment and fill in the needed options) and run the program again.")
+            sys.exit(0)
+
+    if config_path:
+        if args.config and not os.path.exists(args.config):
+            logger.error(f"Error: Config file does not exist: {config_path}")
             sys.exit(1)
         if not run_from_config(
-            args.config,
+            config_path,
             log_overrides=log_overrides,
             cli_check_content_hash=args.check_content_hash,
             cli_password=args.password,
             cli_split=args.split,
+            cli_compression_level=cli_compression_level,
+            cli_sevenzip_path=cli_sevenzip_path,
+            cli_sevenzip_args=cli_sevenzip_args,
         ):
             sys.exit(1)
         return
@@ -626,7 +900,21 @@ def main() -> None:
     if not args.sources or not args.dest or not args.name:
         parser.error("the following arguments are required: -s/--sources, -d/--dest, -n/--name (or use -c/--config)")
 
-    if not execute_backup(args.sources, args.dest, args.name, args.split, _resolve_password(args.password), args.check_content_hash):
+    compression_level = None if cli_compression_level is _UNSET else cli_compression_level
+    sevenzip_path = None if cli_sevenzip_path is _UNSET else cli_sevenzip_path
+    sevenzip_args = () if cli_sevenzip_args is _UNSET else cli_sevenzip_args
+    sevenzip = _build_sevenzip_options(sevenzip_path, sevenzip_args)
+
+    if not execute_backup(
+        args.sources,
+        args.dest,
+        args.name,
+        args.split,
+        _resolve_password(args.password),
+        args.check_content_hash,
+        sevenzip=sevenzip,
+        compression_level=compression_level,
+    ):
         sys.exit(1)
 
 

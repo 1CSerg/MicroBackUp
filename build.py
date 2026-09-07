@@ -48,6 +48,7 @@ def ensure_dependencies():
     print("Checking dependencies...")
     try:
         import multivolumefile  # noqa: F401
+        import pathspec  # noqa: F401
         import py7zr  # noqa: F401
         import PyInstaller  # noqa: F401
     except ImportError:
